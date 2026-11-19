@@ -3,6 +3,7 @@ snapshot.json
 BOUNTY_RULES.txt
 AGENTS.md
 node_modules/
-.makefun/
+.makefun/*
+!.makefun/owner.json
 **/*keypair*.json
 .env
