@@ -3,22 +3,23 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Launch Radar — comps-fitted pre-token board</title>
+<title>Launch Radar</title>
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
-<a class="skip" href="#board">Skip to the board</a>
-<header class="top">
+<a class="skip" href="#main">Skip to the board</a>
+<header class="mast">
   <div class="brand">
-    <span class="mark" aria-hidden="true"></span>
+    <div class="sigil" aria-hidden="true">Lr</div>
     <div>
+      <p class="eyebrow">Pre-token ledger</p>
       <h1>Launch Radar</h1>
-      <p class="tag">Pre-token protocols priced off traded comps · farm plans netted to the dollar</p>
     </div>
   </div>
-  <div id="kpis" class="kpis" aria-label="Model checks"></div>
+  <p class="lede" id="lede">What a book with no token would be worth on today's comps, and whether the farm clears gas.</p>
+  <div class="kpis" id="kpis" aria-label="Fit checks"></div>
 </header>
-<main id="board" tabindex="-1" aria-busy="true"></main>
+<main id="main" tabindex="-1"></main>
 <script src="../data.js"></script>
 <script src="app.js"></script>
 </body>
