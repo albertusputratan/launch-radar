@@ -1,0 +1,14 @@
+node_modules/
+out/
+research/
+package-lock.json
+package.json
+*.tgz
+.makefun/
+**/makefun-keypair.json
+**/*keypair*.json
+**/wallet.json
+.env
+.env.*
+*.pem
+snapshot.json
