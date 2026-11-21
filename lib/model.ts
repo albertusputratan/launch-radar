@@ -29,12 +29,9 @@ export const MODEL_VERSION = "dual-odds-2-re2";
 /** Knobs the page reads back from data.js and uses for the same arithmetic. */
 export const ECON = {
   tbill: 0.04,
-  farm_dph: 60,
+  farm_dph: 25,
   crash: -30,
-  /** Ceiling of the published plan. Each row uses 0.02% of its TVL, floored and capped. */
   deposit: 10_000,
-  deposit_floor: 1_000,
-  deposit_frac: 0.0002,
   share: 0.1,
   weeks: 12,
   shrink_k: 12,
@@ -687,11 +684,6 @@ interface ScoredProto {
   peer: Peer;
 }
 
-/** Published plan size: 0.02% of TVL, never under $1k and never over $10k. */
-function defaultDeposit(tvl: number): number {
-  return c2(Math.max(ECON.deposit_floor, Math.min(ECON.deposit, tvl * ECON.deposit_frac)));
-}
-
 function planNumbers(
   tvl: number,
   implied: number,
@@ -713,8 +705,7 @@ function planNumbers(
   let verdict: "farm" | "thin" | "skip" = "skip";
   if (change !== null && change <= ECON.crash) verdict = "skip";
   else if (!(net > 0)) verdict = "skip";
-  // Farm only when the hour clears $60 and net is clearly ahead of the T-bill (at least 25% more).
-  else if (net > tbill * 1.25 && dph >= ECON.farm_dph) verdict = "farm";
+  else if (net > tbill && dph >= ECON.farm_dph) verdict = "farm";
   else verdict = "thin";
   return { deposit, share, weeks, capture, fees, hours, net, tbill, dph, verdict };
 }
@@ -1067,7 +1058,7 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Reco
     const curve = Math.pow(10, pricing.a + pricing.b * log10(Math.max(1, row.protocol.tvl_usd)));
     const chain = pickChain(row.protocol.chains);
     const play = playId(row.protocol.category);
-    const plan = planNumbers(row.protocol.tvl_usd, priced.implied, row.protocol.change_7d, play, chain, defaultDeposit(row.protocol.tvl_usd), ECON.share, ECON.weeks);
+    const plan = planNumbers(row.protocol.tvl_usd, priced.implied, row.protocol.change_7d, play, chain, ECON.deposit, ECON.share, ECON.weeks);
     const ox = design(row.peer, ospec, oddsFit.fam);
     const spreadLo = Math.pow(10, q25);
     const spreadHi = Math.pow(10, q75);
@@ -1196,8 +1187,6 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Reco
       farm_dph: ECON.farm_dph,
       crash: ECON.crash,
       deposit: ECON.deposit,
-      deposit_floor: ECON.deposit_floor,
-      deposit_frac: ECON.deposit_frac,
       share: ECON.share,
       weeks: ECON.weeks,
       gas: GAS,
