@@ -1,4 +1,4 @@
-/* Launch Radar page. No network. window.RADAR is data.js, written by main.ts from the same model.
+/* Launch Radar page. dual-odds-2-re1. No network. */
    impliedOf = valueIfLaunches × tokenOdds. planOf recomputes the farm when the sliders move. */
 (function () {
   "use strict";
