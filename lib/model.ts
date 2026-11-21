@@ -24,7 +24,7 @@ export interface Snapshot {
   watchlist: string[];
 }
 
-export const MODEL_VERSION = "dual-odds-2-re1";
+export const MODEL_VERSION = "dual-odds-2-re2";
 
 /** Knobs the page reads back from data.js and uses for the same arithmetic. */
 export const ECON = {

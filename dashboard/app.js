@@ -1,4 +1,4 @@
-/* Launch Radar page. dual-odds-2-re1. No network. */
+/* Launch Radar page. dual-odds-2-re2. No network. */
    impliedOf = valueIfLaunches × tokenOdds. planOf recomputes the farm when the sliders move. */
 (function () {
   "use strict";
