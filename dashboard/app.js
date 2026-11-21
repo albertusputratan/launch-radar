@@ -1,10 +1,10 @@
-/* Launch Radar page. dual-odds-2-re2. No network. */
-   impliedOf = valueIfLaunches × tokenOdds. planOf recomputes the farm when the sliders move. */
+/* Launch Radar page. dual-odds-2-re2. No network.
+   impliedOf = valueIfLaunches x tokenOdds. planOf recomputes the farm when the sliders move. */
 (function () {
   "use strict";
   var DATA = window.RADAR;
   var app = document.getElementById("app");
-  var ui = { q: "", tier: "all", verdict: "all", cat: "all", sort: "rank", dir: "asc", dep: "10000", share: 10, weeks: 12, p: "" };
+  var ui = { q: "", tier: "all", verdict: "all", cat: "all", sort: "rank", dir: "asc", dep: "pct", bps: 2, share: 10, weeks: 12, p: "" };
 
   function esc(s) {
     return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
@@ -52,10 +52,19 @@
   function impliedOf(row) {
     return Math.max(1, Math.min(1e14, Math.round(valueIfLaunches(row) * tokenOdds(row))));
   }
+  /** Basis points of TVL. 2 bps = 0.02%. Floored at $1,000 and capped at $10,000. */
+  function bpsOf() {
+    if (ui.dep === "pct10") return 10;
+    if (ui.dep === "pct2") return 2;
+    return ui.bps;
+  }
   function depositOf(row) {
-    if (ui.dep === "pct2") return Math.max(500, Math.round(row.tvl_usd * 0.0002));
-    if (ui.dep === "pct10") return Math.max(500, Math.round(row.tvl_usd * 0.001));
-    return +ui.dep;
+    if (ui.dep === "1000" || ui.dep === "10000" || ui.dep === "25000") return +ui.dep;
+    return Math.max(1000, Math.min(10000, Math.round(row.tvl_usd * bpsOf() / 10000)));
+  }
+  function planSizeLabel() {
+    if (ui.dep === "1000" || ui.dep === "10000" || ui.dep === "25000") return "fixed " + money(+ui.dep);
+    return (bpsOf() / 100).toFixed(2) + "% of TVL";
   }
   /** Capture, fees, T-bill and the verdict for one deposit. Same arithmetic as planNumbers in lib/model.ts. */
   function planOf(row, deposit) {
@@ -181,6 +190,7 @@
   function loadHash() {
     var q = new URLSearchParams(location.hash.replace(/^#/, ""));
     ["q", "tier", "verdict", "cat", "sort", "dir", "dep", "p"].forEach(function (k) { if (q.has(k)) ui[k] = q.get(k); });
+    if (q.has("bps")) ui.bps = Math.max(1, Math.min(10, +q.get("bps") || 2));
     if (q.has("share")) ui.share = +q.get("share");
     if (q.has("weeks")) ui.weeks = +q.get("weeks");
   }
@@ -192,7 +202,8 @@
     if (ui.cat !== "all") q.set("cat", ui.cat);
     if (ui.sort !== "rank") q.set("sort", ui.sort);
     if (ui.dir !== "asc") q.set("dir", ui.dir);
-    if (ui.dep !== "10000") q.set("dep", ui.dep);
+    if (ui.dep !== "pct") q.set("dep", ui.dep);
+    if (ui.bps !== 2) q.set("bps", String(ui.bps));
     if (ui.share !== 10) q.set("share", String(ui.share));
     if (ui.weeks !== 12) q.set("weeks", String(ui.weeks));
     if (ui.p) q.set("p", ui.p);
@@ -243,11 +254,11 @@
     var f = DATA.fit, o = DATA.odds;
     var farmNow = DATA.rows.filter(function (r) { return planOf(r).verdict === "farm"; }).length;
     var cards = [
-      ["×" + f.loo.toFixed(2) + " <em>vs ×" + f.loo_flat.toFixed(2) + "</em>", "OOS miss vs flat · leave-one-out. Walk-forward ×" + f.wf.toFixed(2) + " vs ×" + f.wf_flat.toFixed(2) + "."],
-      [(f.honest50 * 100).toFixed(0) + "%", "Range honesty · held-out caps inside the printed P25–P75 (stated 50%). P10–P90 is " + (f.honest80 * 100).toFixed(0) + "%."],
-      [o.cv.toFixed(3) + " <em>vs " + o.cv_base.toFixed(3) + "</em>", "Token-odds Brier · five-fold, against the base rate. Walk-forward " + o.wf.toFixed(3) + "."],
-      [f.kept + " / " + f.tried + " · " + o.kept + " / " + o.tried, "Terms survived · value model, then token odds. The rest were tested and not kept."],
-      [farmNow + " of " + DATA.board_size, "Worth farming · this deposit, drop share and horizon. " + DATA.verdicts.thin + " marginal and " + DATA.verdicts.skip + " skip at the published plan."],
+      ["×" + f.loo.toFixed(2) + " <em>vs ×" + f.loo_flat.toFixed(2) + "</em>", "Leave-one-out vs flat. Walk-forward ×" + f.wf.toFixed(2) + " vs ×" + f.wf_flat.toFixed(2) + ". Kept only if both improved (held out twice)."],
+      [(f.honest50 * 100).toFixed(0) + "%", "Calibration · held-out check that caps fall in P25–P75 (stated 50%). P10–P90 is " + (f.honest80 * 100).toFixed(0) + "%."],
+      [o.cv.toFixed(3) + " <em>vs " + o.cv_base.toFixed(3) + "</em>", "Token-odds Brier · five-fold vs base rate. Walk-forward " + o.wf.toFixed(3) + ". Same twice-held-out rule."],
+      [f.kept + " / " + f.tried + " · " + o.kept + " / " + o.tried, "Value terms, then token-odds terms, kept only when both leave-one-out and walk-forward improved."],
+      [farmNow + " of " + DATA.board_size, "Farm at " + planSizeLabel() + ", " + ui.share + "% drop, " + ui.weeks + " wk. Bar stays $" + DATA.econ.farm_dph + "/hour."],
       [check.watch + " / " + DATA.watchlist_size, "Watchlist ranked · every protocol the house list names."]
     ];
     var tones = ["", "gold", "orange", "", "green", ""];
@@ -298,11 +309,11 @@
       "<tr><td>P10–P90</td><td class=\"num\">" + (f.honest80 * 100).toFixed(0) + "%</td><td class=\"num\">80%</td><td>leave-one-out</td></tr>" +
       "<tr><td>P25–P75</td><td class=\"num\">" + (f.wf50 * 100).toFixed(0) + "%</td><td class=\"num\">50%</td><td>walk-forward, n=" + f.wf_cov_n + "</td></tr>" +
       "<tr><td>P10–P90</td><td class=\"num\">" + (f.wf80 * 100).toFixed(0) + "%</td><td class=\"num\">80%</td><td>walk-forward</td></tr></table>" +
-      "<p class=\"note\">A term is kept only if it lowers both held-out scores. The placebo, another row's week, is the control.</p>";
+      "<p class=\"note\">Value and token-odds terms stay only if they improve both leave-one-out and walk-forward (held out twice). The bands are a held-out calibration check. Placebo is the control.</p>";
     return "<section class=\"evidence\">" +
       "<div class=\"panel\"><h2>Value if it launches · " + f.comps_n + " priced comps</h2>" + termTable(f.terms, "value") + "</div>" +
       "<div class=\"panel\"><h2>Token odds · Brier, lower is better</h2>" + termTable(DATA.odds.terms, "odds") + "</div>" +
-      "<div class=\"panel\"><h2>Is the printed range honest?</h2>" + range + "</div></section>";
+      "<div class=\"panel\"><h2>Calibration · P25–P75 / P10–P90</h2>" + range + "</div></section>";
   }
   function tools(n) {
     var catOpts = "<option value=\"all\">All categories</option>" + cats().map(function (c) {
@@ -318,8 +329,9 @@
       sel("tier", [["all", "All tiers"], ["watchlist", "Watchlist"], ["early", "Early"], ["off-list", "Off-list"]]) +
       sel("verdict", [["all", "All verdicts"], ["farm", "Farm"], ["thin", "Marginal"], ["skip", "Skip"]]) +
       "<select data-key=\"cat\">" + catOpts + "</select>" +
-      sel("dep", [["1000", "Deposit $1,000"], ["10000", "Deposit $10,000"], ["25000", "Deposit $25,000"], ["pct2", "0.02% of TVL"], ["pct10", "0.10% of TVL"]]) +
-      "<label>Drop <input id=\"share\" type=\"range\" min=\"2\" max=\"20\" value=\"" + ui.share + "\"> <b id=\"sharev\">" + ui.share + "%</b></label>" +
+      sel("dep", [["pct", "Plan size · % of TVL"], ["1000", "Fixed $1,000"], ["10000", "Fixed $10,000"], ["25000", "Fixed $25,000"], ["pct10", "0.10% of TVL"]]) +
+      "<label>Plan size · % of TVL <input id=\"bps\" type=\"range\" min=\"1\" max=\"10\" value=\"" + bpsOf() + "\"> <b id=\"bpsv\">" + planSizeLabel() + "</b></label>" +
+      "<label>Drop share <input id=\"share\" type=\"range\" min=\"2\" max=\"20\" value=\"" + ui.share + "\"> <b id=\"sharev\">" + ui.share + "%</b></label>" +
       "<label>Horizon <input id=\"weeks\" type=\"range\" min=\"4\" max=\"24\" value=\"" + ui.weeks + "\"> <b id=\"weekv\">" + ui.weeks + " wk</b></label>" +
       "<span class=\"count\">" + n + " shown</span></div>";
   }
@@ -346,7 +358,7 @@
       "<td class=\"num\"><span class=\"odds\"><i style=\"width:" + Math.round(row.odds * 100) + "%\"></i></span>" + Math.round(row.odds * 100) + "%</td>" +
       "<td class=\"num\">" + money(row.value_if_usd) + "</td>" +
       "<td class=\"num\">" + spark(row) + money(row.implied_value_usd) + "<br><span class=\"sub\">" + money(row.implied_lo) + "–" + money(row.implied_hi) + "</span></td>" +
-      "<td class=\"num\"><span class=\"v " + plan.verdict + "\">" + label(plan.verdict) + "</span><br>" + money(plan.net) + "</td>" +
+      "<td class=\"num\"><span class=\"v " + plan.verdict + "\">" + label(plan.verdict) + "</span><br>" + money(plan.net) + "<br><span class=\"sub\">" + money(plan.deposit) + "</span></td>" +
       "<td class=\"num\">" + money(plan.dph) + "</td></tr>";
   }
   function board(rows) {
@@ -437,11 +449,11 @@
       (f.use.growth ? " × 7-day growth" : "") + (f.use.chains ? " × chain count" : "") +
       (f.use.cat ? " × category" : "") + (f.use.age ? " × years listed" : "") +
       " × scale " + f.scale.toFixed(2) + ". Odds keep " + DATA.odds.names.filter(function (n) { return n !== "intercept"; }).join(", ") + ".";
-    return "<header class=\"top\"><h1><span>Launch</span> Radar</h1><p>Pre-token protocols, valued from their own record. " + esc(DATA.as_of) + ".</p><div class=\"grow\">" + esc(DATA.model_version) + " · " + DATA.board_size + " rows · " + f.comps_n + " comps</div></header>" +
+    return "<header class=\"top\"><h1><span>Launch</span> Radar</h1><p>Held out twice: value terms and token-odds terms stay only if both leave-one-out and walk-forward improve. Range honesty is a held-out calibration check (P25–P75 / P10–P90). " + esc(DATA.as_of) + ".</p><div class=\"grow\">" + esc(DATA.model_version) + " · " + DATA.board_size + " rows</div></header>" +
       kpis(check) + "<p class=\"formula\">" + formula + "</p>" + ledgerBar() + integrity(check) +
+      (ui.p ? "" : tools(rows.length)) +
       (ui.p ? "" : evidence()) +
-      "<div class=\"back\">" + (ui.p ? "<button type=\"button\" id=\"back\">← Board</button>" : "") + "</div>" +
-      (ui.p ? "" : tools(rows.length));
+      "<div class=\"back\">" + (ui.p ? "<button type=\"button\" id=\"back\">← Board</button>" : "") + "</div>";
   }
 
   function paint() {
@@ -463,8 +475,15 @@
     app.querySelectorAll("select[data-key]").forEach(function (el) {
       el.addEventListener("change", function () { ui[el.getAttribute("data-key")] = el.value; ui.p = ""; writeHash(); });
     });
+    var bps = document.getElementById("bps");
     var share = document.getElementById("share");
     var weeks = document.getElementById("weeks");
+    if (bps) bps.addEventListener("input", function () {
+      ui.bps = +bps.value;
+      if (ui.dep === "pct10" || ui.dep === "pct2" || ui.dep === "1000" || ui.dep === "10000" || ui.dep === "25000") ui.dep = "pct";
+      document.getElementById("bpsv").textContent = planSizeLabel();
+      paint();
+    });
     if (share) share.addEventListener("input", function () { ui.share = +share.value; document.getElementById("sharev").textContent = ui.share + "%"; paint(); });
     if (weeks) weeks.addEventListener("input", function () { ui.weeks = +weeks.value; document.getElementById("weekv").textContent = ui.weeks + " wk"; paint(); });
     app.querySelectorAll("th[data-sort]").forEach(function (th) {
