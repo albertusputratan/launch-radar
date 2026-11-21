@@ -1,10 +1,10 @@
-/* Launch Radar page. dual-odds-2-re2. No network. */
-   impliedOf = valueIfLaunches × tokenOdds. planOf recomputes the farm when the sliders move. */
+/* Launch Radar page. dual-odds-2-re2. No network.
+   impliedOf = valueIfLaunches x tokenOdds. planOf recomputes the farm when the sliders move. */
 (function () {
   "use strict";
   var DATA = window.RADAR;
   var app = document.getElementById("app");
-  var ui = { q: "", tier: "all", verdict: "all", cat: "all", sort: "rank", dir: "asc", dep: "10000", share: 10, weeks: 12, p: "" };
+  var ui = { q: "", tier: "all", verdict: "all", cat: "all", sort: "rank", dir: "asc", dep: "sized", share: 10, weeks: 12, p: "" };
 
   function esc(s) {
     return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
@@ -53,7 +53,12 @@
     return Math.max(1, Math.min(1e14, Math.round(valueIfLaunches(row) * tokenOdds(row))));
   }
   function depositOf(row) {
-    if (ui.dep === "pct2") return Math.max(500, Math.round(row.tvl_usd * 0.0002));
+    if (ui.dep === "sized" || ui.dep === "pct2") {
+      var frac = ui.dep === "pct2" ? 0.0002 : (DATA.econ.deposit_frac || 0.0002);
+      var floor = ui.dep === "pct2" ? 1000 : (DATA.econ.deposit_floor || 1000);
+      var ceil = DATA.econ.deposit || 10000;
+      return c2(Math.max(floor, Math.min(ceil, row.tvl_usd * frac)));
+    }
     if (ui.dep === "pct10") return Math.max(500, Math.round(row.tvl_usd * 0.001));
     return +ui.dep;
   }
@@ -74,7 +79,7 @@
     var verdict = "skip";
     if (row.change_7d != null && row.change_7d <= DATA.econ.crash) verdict = "skip";
     else if (!(net > 0)) verdict = "skip";
-    else if (net > tbill && dph >= DATA.econ.farm_dph) verdict = "farm";
+    else if (net > tbill * 1.25 && dph >= DATA.econ.farm_dph) verdict = "farm";
     else verdict = "thin";
     return { deposit: dep, share: share, weeks: weeks, capture: capture, fees: fees, hours: hours, net: net, tbill: tbill, dph: dph, verdict: verdict, gas: quote[0], fund: quote[1], how: how };
   }
@@ -91,8 +96,8 @@
       var saved = { share: ui.share, weeks: ui.weeks, dep: ui.dep };
       ui.share = Math.round(DATA.econ.share * 100);
       ui.weeks = DATA.econ.weeks;
-      ui.dep = String(DATA.econ.deposit);
-      var plan = planOf(row, DATA.econ.deposit);
+      ui.dep = "sized";
+      var plan = planOf(row);
       ui.share = saved.share; ui.weeks = saved.weeks; ui.dep = saved.dep;
       if (impliedOf(row) === row.implied_value_usd && plan.verdict === row.plan.verdict && Math.abs(plan.net - row.plan.net) < 0.02) match += 1;
     }
@@ -192,7 +197,7 @@
     if (ui.cat !== "all") q.set("cat", ui.cat);
     if (ui.sort !== "rank") q.set("sort", ui.sort);
     if (ui.dir !== "asc") q.set("dir", ui.dir);
-    if (ui.dep !== "10000") q.set("dep", ui.dep);
+    if (ui.dep !== "sized") q.set("dep", ui.dep);
     if (ui.share !== 10) q.set("share", String(ui.share));
     if (ui.weeks !== 12) q.set("weeks", String(ui.weeks));
     if (ui.p) q.set("p", ui.p);
@@ -241,13 +246,19 @@
 
   function kpis(check) {
     var f = DATA.fit, o = DATA.odds;
-    var farmNow = DATA.rows.filter(function (r) { return planOf(r).verdict === "farm"; }).length;
+    var farmNow = 0, thinNow = 0, skipNow = 0;
+    DATA.rows.forEach(function (r) {
+      var v = planOf(r).verdict;
+      if (v === "farm") farmNow += 1;
+      else if (v === "thin") thinNow += 1;
+      else skipNow += 1;
+    });
     var cards = [
       ["×" + f.loo.toFixed(2) + " <em>vs ×" + f.loo_flat.toFixed(2) + "</em>", "OOS miss vs flat · leave-one-out. Walk-forward ×" + f.wf.toFixed(2) + " vs ×" + f.wf_flat.toFixed(2) + "."],
       [(f.honest50 * 100).toFixed(0) + "%", "Range honesty · held-out caps inside the printed P25–P75 (stated 50%). P10–P90 is " + (f.honest80 * 100).toFixed(0) + "%."],
       [o.cv.toFixed(3) + " <em>vs " + o.cv_base.toFixed(3) + "</em>", "Token-odds Brier · five-fold, against the base rate. Walk-forward " + o.wf.toFixed(3) + "."],
       [f.kept + " / " + f.tried + " · " + o.kept + " / " + o.tried, "Terms survived · value model, then token odds. The rest were tested and not kept."],
-      [farmNow + " of " + DATA.board_size, "Worth farming · this deposit, drop share and horizon. " + DATA.verdicts.thin + " marginal and " + DATA.verdicts.skip + " skip at the published plan."],
+      [farmNow + " of " + DATA.board_size, "Worth farming · this deposit, drop share and horizon. " + thinNow + " marginal and " + skipNow + " skip."],
       [check.watch + " / " + DATA.watchlist_size, "Watchlist ranked · every protocol the house list names."]
     ];
     var tones = ["", "gold", "orange", "", "green", ""];
@@ -318,7 +329,7 @@
       sel("tier", [["all", "All tiers"], ["watchlist", "Watchlist"], ["early", "Early"], ["off-list", "Off-list"]]) +
       sel("verdict", [["all", "All verdicts"], ["farm", "Farm"], ["thin", "Marginal"], ["skip", "Skip"]]) +
       "<select data-key=\"cat\">" + catOpts + "</select>" +
-      sel("dep", [["1000", "Deposit $1,000"], ["10000", "Deposit $10,000"], ["25000", "Deposit $25,000"], ["pct2", "0.02% of TVL"], ["pct10", "0.10% of TVL"]]) +
+      sel("dep", [["sized", "0.02% of TVL · $1k–$10k"], ["1000", "Deposit $1,000"], ["10000", "Deposit $10,000"], ["25000", "Deposit $25,000"], ["pct10", "0.10% of TVL"]]) +
       "<label>Drop <input id=\"share\" type=\"range\" min=\"2\" max=\"20\" value=\"" + ui.share + "\"> <b id=\"sharev\">" + ui.share + "%</b></label>" +
       "<label>Horizon <input id=\"weeks\" type=\"range\" min=\"4\" max=\"24\" value=\"" + ui.weeks + "\"> <b id=\"weekv\">" + ui.weeks + " wk</b></label>" +
       "<span class=\"count\">" + n + " shown</span></div>";
