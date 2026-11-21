@@ -79,10 +79,26 @@ writeFileSync(
   }),
 );
 
-const fit = radar.fit;
+const fit = radar.fit as {
+  loo: number;
+  loo_flat: number;
+  wf: number;
+  wf_flat: number;
+  loo_n: number;
+  wf_n: number;
+  beats_flat: boolean;
+  kept: number;
+  tried: number;
+  comps_n: number;
+  honest50: number;
+};
+const odds = radar.odds as { cv: number; cv_base: number; kept: number; tried: number };
+const verdicts = radar.verdicts as { farm: number; thin: number; skip: number };
+const ledgerTotal = radar.ledger_total as number;
 process.stdout.write(
-  `launch radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows (${radar.early_size} early, ${fit.comps_used} comps)\n` +
-    `launch radar: leave-one-out ${(fit.loo_mape * 100).toFixed(1)}% vs flat ${(fit.loo_flat_mape * 100).toFixed(1)}% (n=${fit.loo_n}); walk-forward ${(fit.wf_mape * 100).toFixed(1)}% vs flat ${(fit.wf_flat_mape * 100).toFixed(1)}% (n=${fit.wf_n}); ${fit.beats_flat ? "beats flat" : "flat is closer"}\n` +
-    `launch radar: verdicts farm ${radar.verdicts.farm}, thin ${radar.verdicts.thin}, skip ${radar.verdicts.skip}\n` +
+  `launch radar: ${snapshot.protocols.length} protocols, watchlist ${radar.watchlist_ranked}/${snapshot.watchlist.length}, ${board.length} rows, ${fit.comps_n} priced comps\n` +
+    `launch radar: OOS miss ${fit.loo.toFixed(2)}× vs flat ${fit.loo_flat.toFixed(2)}× (leave-one-out n=${fit.loo_n}); walk-forward ${fit.wf.toFixed(2)}× vs flat ${fit.wf_flat.toFixed(2)}× (n=${fit.wf_n}); ${fit.beats_flat ? "beats flat" : "flat is closer"}\n` +
+    `launch radar: token-odds Brier ${odds.cv.toFixed(3)} vs base ${odds.cv_base.toFixed(3)}; value terms kept ${fit.kept}/${fit.tried}; odds terms kept ${odds.kept}/${odds.tried}; range honesty ${(fit.honest50 * 100).toFixed(0)}%\n` +
+    `launch radar: verdicts farm ${verdicts.farm}, thin ${verdicts.thin}, skip ${verdicts.skip}; ledger ${ledgerTotal}\n` +
     `launch radar: wrote ${join(out, "board.json")}, ${join(out, "data.js")}, dashboard, ${shots.length} screenshots, dossier.json\n`,
 );

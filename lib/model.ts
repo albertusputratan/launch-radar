@@ -1,5 +1,7 @@
-// Comps-fitted pre-token valuation. Node 22, standard library only.
-// Every input is a field on the sealed snapshot. No protocol is named in the fit.
+// Dual launch model. Node 22, standard library only.
+// Implied value = (what a token would be worth if the record stayed as it is) × (the peers' token odds).
+// Every coefficient is fit on this snapshot and kept only when it lowers both held-out misses.
+// No protocol is priced by name. The only names in the rules are the house's exchange prefixes.
 
 export interface SnapshotProtocol {
   slug: string;
@@ -22,114 +24,86 @@ export interface Snapshot {
   watchlist: string[];
 }
 
-/** Knobs for the curve, the age adjustment, and the farm arithmetic. */
-export const CONST = {
-  growth_weight: 0.3,
-  growth_floor: -40,
-  growth_cap: 80,
-  maturity_floor: 0.82,
-  maturity_span: 0.28,
-  maturity_days: 1460,
-  unknown_age_days: 400,
-  shrink_k: 6,
-  min_category_n: 3,
-  min_mult: 0.02,
-  max_mult: 5,
-  min_comp_tvl: 5_000_000,
-  elasticity_min: 0.55,
-  elasticity_max: 1.05,
-  pool_frac: 0.002,
-  farmer_scale: 90,
-  farmer_power: 0.45,
-  farmer_floor: 60,
-  weight_base: 40,
-  weight_floor: 0.9,
-  weight_per_week: 0.025,
-  weight_week_cap: 8,
-  capture_floor_usd: 80,
-  capture_capital_multiple: 3,
-  setup_minutes: 20,
-  weekly_minutes: 12,
-  claim_minutes: 15,
-  chain_switch_usd: 8,
-  default_setup_usd: 2,
-  default_weekly_usd: 0.65,
-  farm_dph: 28,
-  farm_net_usd: 36,
-  farm_growth_floor: -12,
-  thin_dph: 10,
-  thin_net_usd: 12,
-  crash_7d: -30,
-  implied_cap: 100_000_000_000_000,
-} as const;
+export const MODEL_VERSION = "dual-odds-2";
 
-export const MODEL_VERSION = "ledger-logmcap-1";
+/** Knobs the page reads back from data.js and uses for the same arithmetic. */
+export const ECON = {
+  tbill: 0.04,
+  farm_dph: 25,
+  crash: -30,
+  deposit: 10_000,
+  share: 0.1,
+  weeks: 12,
+  shrink_k: 12,
+  min_cat_n: 4,
+  fam_k: 16,
+  min_multiple: 0.03,
+  max_multiple: 12,
+  receipt_band: 0.02,
+  keep_miss: 0.01,
+  keep_brier: 0.001,
+  boot: 64,
+  age_unknown: 400,
+  age_clamp: [0.75, 1.3] as const,
+  implied_cap: 100_000_000_000_000,
+};
 
 const DAY_MS = 86_400_000;
 const VERSIONED = /\s(?:V\d+(?:\.\d+)?|v\d+(?:\.\d+)?|\d+\.\d+)$/;
-const EXCHANGES = ["binance", "coinbase", "bybit", "kraken", "bitget", "okx", "bitfinex", "gemini"];
-const EXCLUDE_CATEGORY = new Set([
-  "Bridge",
-  "Canonical Bridge",
-  "Cross Chain Bridge",
-  "Liquid Staking",
-  "Liquid Restaking",
-  "Restaked BTC",
-  "CEX",
-]);
+const WRAPPED = /\b(?:wrapped|staked|staking)\b/i;
+const EXCHANGES = /^(?:binance|coinbase|bybit|kraken|bitget|okx|bitfinex|gemini)\b/i;
+const BRIDGE = new Set(["Bridge", "Canonical Bridge", "Cross Chain Bridge"]);
+const LST = new Set(["Liquid Staking", "Liquid Restaking", "Restaked BTC"]);
 
-/** Known gas quotes in USD: [open the position, one later action]. Unknown chains use the mid default. */
-const GAS_QUOTE: Record<string, readonly [number, number]> = {
-  Ethereum: [14, 4.5],
-  Bitcoin: [8, 2.5],
-  Tron: [2.2, 0.7],
-  Avalanche: [1.5, 0.45],
-  Binance: [0.4, 0.12],
-  Base: [0.7, 0.22],
-  Arbitrum: [0.9, 0.28],
-  Optimism: [0.75, 0.24],
-  Polygon: [0.35, 0.1],
-  Solana: [0.25, 0.08],
-  "Hyperliquid L1": [0.5, 0.16],
-  Sui: [0.3, 0.1],
-  Aptos: [0.3, 0.1],
-  Stellar: [0.15, 0.05],
-  Monad: [0.6, 0.2],
-  Plasma: [0.6, 0.2],
-  Linea: [0.8, 0.25],
-  Scroll: [0.9, 0.3],
-  Blast: [0.5, 0.16],
-  Mantle: [0.45, 0.14],
-  "zkSync Era": [0.7, 0.22],
-  Starknet: [0.8, 0.25],
-  Ton: [0.3, 0.1],
-  TON: [0.3, 0.1],
-  Near: [0.35, 0.12],
-  Sei: [0.4, 0.12],
-  Sonic: [0.4, 0.12],
-  Berachain: [0.5, 0.16],
-  Unichain: [0.7, 0.22],
-  Celo: [0.3, 0.1],
-  Gnosis: [0.2, 0.08],
-  Manta: [0.5, 0.16],
-  Mode: [0.5, 0.16],
-  Fraxtal: [0.6, 0.2],
-  Taiko: [0.8, 0.25],
-  "World Chain": [0.6, 0.2],
-  Ink: [0.6, 0.2],
-  Soneium: [0.6, 0.2],
-  Katana: [0.7, 0.22],
-  Corn: [0.7, 0.22],
-  Morph: [0.6, 0.2],
-  "Robinhood Chain": [0.7, 0.22],
-  Cronos: [0.4, 0.12],
-  Fantom: [0.4, 0.12],
-  Moonbeam: [0.4, 0.12],
-  Aurora: [0.4, 0.12],
-  Ronin: [0.3, 0.1],
-  "Polygon zkEVM": [0.6, 0.2],
-  "Arbitrum Nova": [0.3, 0.1],
-  opBNB: [0.25, 0.08],
+/** [gas per transaction, exchange withdrawal], USD. Unknown chains use GAS_DEFAULT. */
+export const GAS: Record<string, readonly [number, number]> = {
+  Ethereum: [2.5, 5],
+  Bitcoin: [1.2, 2],
+  Tron: [0.8, 1.2],
+  Binance: [0.08, 0.3],
+  Avalanche: [0.08, 0.5],
+  Polygon: [0.02, 0.3],
+  Solana: [0.01, 0.8],
+  Sui: [0.01, 0.5],
+  Aptos: [0.01, 0.5],
+  Base: [0.04, 0.5],
+  Arbitrum: [0.04, 0.5],
+  Optimism: [0.04, 0.5],
+  Scroll: [0.05, 0.6],
+  Linea: [0.05, 0.6],
+  Blast: [0.04, 0.5],
+  Mantle: [0.04, 0.5],
+  "zkSync Era": [0.05, 0.6],
+  Starknet: [0.06, 0.7],
+  Monad: [0.03, 0.8],
+  "Hyperliquid L1": [0.02, 0.8],
+  Ink: [0.04, 0.8],
+  Unichain: [0.04, 0.6],
+  Berachain: [0.05, 0.7],
+  Sonic: [0.04, 0.5],
+  Sei: [0.03, 0.5],
+  Ton: [0.05, 0.4],
+  TON: [0.05, 0.4],
+  Near: [0.03, 0.4],
+  Celo: [0.03, 0.4],
+  Gnosis: [0.02, 0.4],
+  Plasma: [0.04, 0.6],
+  Manta: [0.04, 0.5],
+  Mode: [0.04, 0.5],
+  Fraxtal: [0.04, 0.5],
+  Taiko: [0.05, 0.6],
+};
+
+export const GAS_DEFAULT: readonly [number, number] = [0.06, 1.1];
+
+export const PLAYS: Record<string, { label: string; txIn: number; txWeek: number; txOut: number; minIn: number; minWeek: number; minOut: number }> = {
+  vault: { label: "Vault deposit", txIn: 2, txWeek: 0, txOut: 1, minIn: 15, minWeek: 5, minOut: 12 },
+  lend: { label: "Supply and borrow", txIn: 3, txWeek: 0, txOut: 2, minIn: 18, minWeek: 5, minOut: 12 },
+  lp: { label: "Pool liquidity", txIn: 3, txWeek: 1, txOut: 1, minIn: 18, minWeek: 8, minOut: 12 },
+  perp: { label: "Margin", txIn: 2, txWeek: 1, txOut: 1, minIn: 15, minWeek: 8, minOut: 10 },
+  rwa: { label: "Tokenised asset", txIn: 2, txWeek: 0, txOut: 1, minIn: 20, minWeek: 5, minOut: 12 },
+  stake: { label: "Stake", txIn: 2, txWeek: 0, txOut: 1, minIn: 15, minWeek: 5, minOut: 12 },
+  use: { label: "Use the app", txIn: 2, txWeek: 1, txOut: 1, minIn: 15, minWeek: 6, minOut: 10 },
 };
 
 export class SnapshotError extends Error {
@@ -139,191 +113,278 @@ export class SnapshotError extends Error {
   }
 }
 
-interface Effect {
-  premium: number;
-  n: number;
-}
-
-interface Fit {
-  a: number;
-  b: number;
-  scale: number;
-  effects: Map<string, Effect>;
-  globalMultiple: number;
-}
-
-interface ChainChoice {
-  chain: string;
-  primary: string | null;
-  only: boolean;
-  known: boolean;
-  setup: number;
-  weekly: number;
-  primarySetup: number;
-}
-
-export interface FarmStep {
-  text: string;
-  cost: string;
-  time: string;
-}
-
 export interface BoardRow {
   rank: number;
   slug: string;
   name: string;
+  implied_value_usd: number;
+  farm_steps: string[];
+  tier: string;
+  verdict: "farm" | "thin" | "skip";
+}
+
+interface Factor {
+  name: string;
+  mult: number;
+  used: boolean;
+}
+
+interface RadarRow {
+  rank: number;
+  rank_lo: number;
+  rank_hi: number;
+  slug: string;
+  name: string;
   category: string | null;
   chains: string[];
   tvl_usd: number;
   change_7d: number | null;
   listed_at: string | null;
   age_days: number | null;
-  token_status: "pre-token";
+  tier: "watchlist" | "early" | "off-list";
   on_watchlist: boolean;
+  g: number;
+  ox: number[];
+  curve: number;
+  factors: Factor[];
+  value_if_usd: number;
+  odds: number;
   implied_value_usd: number;
-  model: {
-    curve_mcap_usd: number;
-    fitted_mcap_usd: number;
-    fitted_multiple: number;
-    category_premium: number;
-    category_n: number;
-    growth_pct: number;
-    growth_multiplier: number;
-    maturity_multiplier: number;
-    farm_chain: string;
-    farm_capital_usd: number;
-    farm_gas_usd: number;
-    farm_hours: number;
-    capture_usd: number;
-    net_usd: number;
-    dollars_per_hour: number;
-    break_even_pct: number;
+  implied_lo: number;
+  implied_hi: number;
+  play: string;
+  farm_chain: string;
+  plan: {
+    deposit: number;
+    share: number;
+    weeks: number;
+    capture: number;
+    fees: number;
+    hours: number;
+    net: number;
+    tbill: number;
+    dph: number;
     verdict: "farm" | "thin" | "skip";
   };
-  farm_steps: string[];
+  steps: string[];
 }
 
-export interface RadarRow {
-  rank: number;
-  slug: string;
+interface TermRow {
   name: string;
-  category: string | null;
-  chains: string[];
-  tvl_usd: number;
-  change_7d: number | null;
-  listed_at: string | null;
-  age_days: number | null;
-  on_watchlist: boolean;
-  implied_value_usd: number;
-  curve_mcap_usd: number;
-  fitted_mcap_usd: number;
-  fitted_multiple: number;
-  category_premium: number;
-  category_n: number;
-  growth_pct: number;
-  growth_multiplier: number;
-  maturity_multiplier: number;
-  farm_chain: string;
-  farm_chain_note: string;
-  farm_capital_usd: number;
-  farm_gas_usd: number;
-  farm_hours: number;
-  farm_setup_usd: number;
-  farm_weekly_usd: number;
-  farm_weeks: number;
-  farm_hold_days: number;
-  capture_usd: number;
-  capture_capped: boolean;
-  active_farmers: number;
-  position_weight: number;
-  pool_usd: number;
-  net_usd: number;
-  dollars_per_hour: number;
-  break_even_pct: number;
-  verdict: "farm" | "thin" | "skip";
-  verdict_reason: string;
-  steps: FarmStep[];
-}
-
-export interface CompRow {
-  slug: string;
-  name: string;
-  category: string | null;
-  tvl_usd: number;
-  mcap_usd: number;
-  multiple: number;
-  predicted_mcap_usd: number;
-  error_pct: number;
-}
-
-export interface FitReport {
-  comps_used: number;
-  comps_excluded: number;
-  categories_fit: number;
-  size_a: number;
-  size_b: number;
-  scale: number;
-  global_multiple: number;
-  raw_median_multiple: number;
-  loo_mape: number;
-  loo_flat_mape: number;
-  loo_median_ratio: number;
-  loo_n: number;
-  wf_mape: number;
-  wf_flat_mape: number;
-  wf_n: number;
-  beats_flat: boolean;
-  categories: { category: string; n: number; premium: number; multiple_at_100m: number }[];
-}
-
-export interface RadarData {
-  as_of: string;
-  source: string;
-  floor_usd: number;
-  model_version: string;
-  constants: typeof CONST;
-  blurb: string;
+  loo: number;
+  wf: number;
+  kept: boolean;
   note: string;
-  assumptions: string;
-  fit: FitReport;
-  watchlist_size: number;
-  board_size: number;
-  early_size: number;
-  verdicts: { farm: number; thin: number; skip: number };
-  rows: RadarRow[];
-  comps: CompRow[];
 }
 
-const r2 = (n: number): number => Math.round(n * 100) / 100;
+interface OddsTerm {
+  name: string;
+  cv: number;
+  wf: number;
+  kept: boolean;
+  note: string;
+}
+
+interface VComp {
+  slug: string;
+  cat: string;
+  tvl: number;
+  mcap: number;
+  x: number;
+  ly: number;
+  g: number;
+  age: number | null;
+  listed: string;
+  chains: number;
+  placebo: number;
+}
+
+interface Peer {
+  slug: string;
+  cat: string;
+  y: number;
+  tvl: number;
+  g: number;
+  age: number | null;
+  listed: string;
+  chains: number;
+  placebo: number;
+  ltvl: number;
+  lage: number;
+  chf: number;
+}
+
+interface VSpec {
+  cat: boolean;
+  growth: boolean;
+  age: boolean;
+  chains: boolean;
+  placebo: boolean;
+}
+
+interface OSpec {
+  age: boolean;
+  fam: boolean;
+  tvl: boolean;
+  growth: boolean;
+  chains: boolean;
+  placebo: boolean;
+}
+
+interface VFit {
+  flat: number | null;
+  a: number;
+  b: number;
+  scale: number;
+  cat: Map<string, number>;
+  gCoef: number;
+  gMean: number;
+  ageCoef: number;
+  ageRef: number;
+  chCoef: number;
+  chMean: number;
+  plCoef: number;
+  plMean: number;
+  spec: VSpec;
+}
+
+const EMPTY_SPEC: VSpec = { cat: false, growth: false, age: false, chains: false, placebo: false };
+const EMPTY_ODDS: OSpec = { age: false, fam: false, tvl: false, growth: false, chains: false, placebo: false };
+
+const log10 = (x: number): number => Math.log(x) / Math.LN10;
+const clamp = (x: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, x));
+const c2 = (n: number): number => Math.round(n * 100) / 100;
 const r4 = (n: number): number => Math.round(n * 1e4) / 1e4;
-const r6 = (n: number): number => Math.round(n * 1e6) / 1e6;
+const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
-function cmpStr(a: string, b: string): number {
-  return a < b ? -1 : a > b ? 1 : 0;
+function median(values: number[]): number {
+  if (values.length === 0) return 0;
+  const s = [...values].sort((a, b) => a - b);
+  const m = (s.length - 1) / 2;
+  return (s[Math.floor(m)]! + s[Math.ceil(m)]!) / 2;
 }
 
-function finite(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+function quantile(values: number[], q: number): number {
+  if (values.length === 0) return 0;
+  const s = [...values].sort((a, b) => a - b);
+  const idx = (s.length - 1) * q;
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  if (lo === hi) return s[lo]!;
+  return s[lo]! * (hi - idx) + s[hi]! * (idx - lo);
 }
 
-function dollars(n: number): number {
-  if (!Number.isFinite(n) || n <= 0) return 1;
-  return Math.min(CONST.implied_cap, Math.max(1, Math.round(n)));
+function mean(values: number[]): number {
+  if (values.length === 0) return 0;
+  let s = 0;
+  for (const v of values) s += v;
+  return s / values.length;
 }
 
-function money(n: number): string {
-  if (!Number.isFinite(n)) return "$0.00";
-  const sign = n < 0 ? "-" : "";
-  const a = Math.abs(n);
-  if (a >= 1e9) return `${sign}$${(a / 1e9).toFixed(2)}B`;
-  if (a >= 1e6) return `${sign}$${(a / 1e6).toFixed(2)}M`;
-  if (a >= 10_000) return `${sign}$${String(Math.round(a)).replace(/\B(?=(\d{3})+(?!\d))/g, ",")}`;
-  if (a >= 1 && Math.abs(a - Math.round(a)) < 0.001) return `${sign}$${Math.round(a)}`;
-  return `${sign}$${a.toFixed(2)}`;
+function ols(xs: number[], ys: number[]): { a: number; b: number } {
+  const n = xs.length;
+  let sx = 0;
+  let sy = 0;
+  let sxx = 0;
+  let sxy = 0;
+  for (let i = 0; i < n; i++) {
+    sx += xs[i]!;
+    sy += ys[i]!;
+    sxx += xs[i]! * xs[i]!;
+    sxy += xs[i]! * ys[i]!;
+  }
+  const den = n * sxx - sx * sx;
+  const b = Math.abs(den) < 1e-9 ? 1 : (n * sxy - sx * sy) / den;
+  return { a: n ? (sy - b * sx) / n : 0, b: Number.isFinite(b) ? b : 1 };
 }
 
-function pctText(frac: number): string {
-  return `${Math.round(frac * 1000) / 10}%`;
+function centeredSlope(xs: number[], ys: number[]): number {
+  const n = xs.length;
+  if (n < 3) return 0;
+  const mx = mean(xs);
+  const my = mean(ys);
+  let num = 0;
+  let den = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = xs[i]! - mx;
+    num += dx * (ys[i]! - my);
+    den += dx * dx;
+  }
+  return den < 1e-12 ? 0 : num / den;
+}
+
+function solve(A: number[][], b: number[]): number[] {
+  const n = b.length;
+  const M = A.map((row, i) => [...row, b[i]!]);
+  for (let col = 0; col < n; col++) {
+    let piv = col;
+    for (let r = col + 1; r < n; r++) if (Math.abs(M[r]![col]!) > Math.abs(M[piv]![col]!)) piv = r;
+    const tmp = M[col]!;
+    M[col] = M[piv]!;
+    M[piv] = tmp;
+    let diag = M[col]![col]!;
+    if (Math.abs(diag) < 1e-12) diag = diag < 0 ? -1e-12 : 1e-12;
+    for (let r = 0; r < n; r++) {
+      if (r === col) continue;
+      const f = M[r]![col]! / diag;
+      for (let k = col; k <= n; k++) M[r]![k] = M[r]![k]! - f * M[col]![k]!;
+    }
+    for (let k = col; k <= n; k++) M[col]![k] = M[col]![k]! / diag;
+  }
+  return M.map((row) => row[n]!);
+}
+
+function sigmoid(z: number): number {
+  const x = clamp(z, -20, 20);
+  return 1 / (1 + Math.exp(-x));
+}
+
+function fitLogit(X: number[][], y: number[]): number[] {
+  const n = y.length;
+  const d = X[0]!.length;
+  const w = Array(d).fill(0);
+  for (let it = 0; it < 24; it++) {
+    const H = Array.from({ length: d }, () => Array(d).fill(0));
+    const g = Array(d).fill(0);
+    for (let i = 0; i < n; i++) {
+      let z = 0;
+      for (let k = 0; k < d; k++) z += X[i]![k]! * w[k]!;
+      const p = sigmoid(z);
+      const v = Math.max(1e-5, p * (1 - p));
+      const err = y[i]! - p;
+      for (let a = 0; a < d; a++) {
+        g[a] += X[i]![a]! * err;
+        const xa = X[i]![a]! * v;
+        for (let b = 0; b < d; b++) H[a]![b] += xa * X[i]![b]!;
+      }
+    }
+    for (let a = 0; a < d; a++) H[a]![a] += 1e-3;
+    const delta = solve(H, g);
+    let step = 0;
+    for (let a = 0; a < d; a++) {
+      w[a] += delta[a]!;
+      step += Math.abs(delta[a]!);
+    }
+    if (step < 1e-7) break;
+  }
+  return w;
+}
+
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function resample<T>(rng: () => number, rows: T[]): T[] {
+  const n = rows.length;
+  const out: T[] = new Array(n);
+  for (let i = 0; i < n; i++) out[i] = rows[Math.floor(rng() * n)]!;
+  return out;
 }
 
 export function ageDays(asOf: string, listedAt: string | null): number | null {
@@ -334,642 +395,822 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
   return Math.max(0, Math.floor((a - b) / DAY_MS));
 }
 
+function growthOf(change: number | null): number {
+  return clamp(change ?? 0, -40, 80) / 100;
+}
+
+function bridgeCat(p: SnapshotProtocol): boolean {
+  return p.category !== null && BRIDGE.has(p.category);
+}
+function lstCat(p: SnapshotProtocol): boolean {
+  return p.category !== null && LST.has(p.category);
+}
+function exchangeish(p: SnapshotProtocol): boolean {
+  return p.category === "CEX" || EXCHANGES.test(p.name);
+}
+function wrappedName(p: SnapshotProtocol): boolean {
+  return VERSIONED.test(p.name) || WRAPPED.test(p.name);
+}
+
+function houseOut(p: SnapshotProtocol): boolean {
+  return bridgeCat(p) || lstCat(p) || exchangeish(p) || wrappedName(p);
+}
+
 export function recordsNoToken(p: SnapshotProtocol): boolean {
-  return p.mcap_usd === null && p.gecko_id === null && p.symbol === null;
+  return !(p.mcap_usd !== null && p.mcap_usd > 0) && p.gecko_id === null && p.symbol === null;
 }
 
-function derivativeName(name: string): boolean {
-  const low = name.toLowerCase();
-  const words = low.split(/[^a-z0-9]+/);
-  if (words.some((w) => w === "wrapped" || w === "staked" || w === "staking")) return true;
-  if (VERSIONED.test(name)) return true;
-  return EXCHANGES.some((e) => low.startsWith(e));
+function tokenTrades(p: SnapshotProtocol): boolean {
+  return p.mcap_usd !== null && p.mcap_usd > 0;
 }
 
-function excludedCategory(category: string | null): boolean {
-  return category !== null && EXCLUDE_CATEGORY.has(category);
+function tokenOnRecord(p: SnapshotProtocol): boolean {
+  return !tokenTrades(p) && (p.gecko_id !== null || p.symbol !== null);
 }
 
-/** A pre-token book that is not a wrapped, bridged, staked, or exchange product. */
 export function isRankable(p: SnapshotProtocol): boolean {
-  if (!recordsNoToken(p)) return false;
-  if (excludedCategory(p.category)) return false;
-  if (derivativeName(p.name)) return false;
-  return true;
+  return recordsNoToken(p) && !houseOut(p);
 }
 
-function isComp(p: SnapshotProtocol): boolean {
-  if (p.mcap_usd === null || !(p.mcap_usd > 0) || !(p.tvl_usd >= CONST.min_comp_tvl)) return false;
-  if (excludedCategory(p.category)) return false;
-  if (derivativeName(p.name)) return false;
-  const mult = p.mcap_usd / p.tvl_usd;
-  return mult >= CONST.min_mult && mult <= CONST.max_mult;
+function playId(category: string | null): string {
+  const c = (category ?? "").toLowerCase();
+  if (c.includes("lend") || c.includes("cdp") || c.includes("collateral")) return "lend";
+  if (c.includes("dex")) return "lp";
+  if (c.includes("deriv") || c.includes("perp") || c.includes("basis") || c.includes("option") || c.includes("predict")) return "perp";
+  if (c.includes("rwa")) return "rwa";
+  if (c.includes("stak") || c.includes("restak")) return "stake";
+  if (c.includes("yield") || c.includes("vault") || c.includes("curat") || c.includes("allocat") || c.includes("farm") || c.includes("index")) return "vault";
+  return "use";
 }
 
-function median(values: number[]): number {
-  if (values.length === 0) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
+function gasOf(chain: string): readonly [number, number] {
+  return GAS[chain] ?? GAS_DEFAULT;
 }
 
-function winsorizedMedian(values: number[]): number {
-  if (values.length < 5) return median(values);
-  const sorted = [...values].sort((a, b) => a - b);
-  const lo = sorted[Math.floor((sorted.length - 1) * 0.1)]!;
-  const hi = sorted[Math.ceil((sorted.length - 1) * 0.9)]!;
-  return median(sorted.map((v) => Math.min(hi, Math.max(lo, v))));
-}
-
-function medianAbsPct(actual: number[], pred: number[]): number {
-  const errors: number[] = [];
-  for (let i = 0; i < actual.length; i++) {
-    const a = actual[i]!;
-    const p = pred[i]!;
-    if (a > 0 && p > 0) errors.push(Math.abs(a - p) / a);
-  }
-  return errors.length === 0 ? 1 : median(errors);
-}
-
-function catKey(category: string | null): string {
-  return category ?? "Uncategorized";
-}
-
-/** log(mcap) = a + b·log(TVL), then a shrunk category premium and a median scale. */
-function fitComps(comps: SnapshotProtocol[]): Fit {
-  const n = comps.length;
-  let sx = 0;
-  let sy = 0;
-  let sxx = 0;
-  let sxy = 0;
-  for (const p of comps) {
-    const x = Math.log(p.tvl_usd);
-    const y = Math.log(p.mcap_usd!);
-    sx += x;
-    sy += y;
-    sxx += x * x;
-    sxy += x * y;
-  }
-  const den = n * sxx - sx * sx;
-  let b = Math.abs(den) < 1e-9 || n < 8 ? 1 : (n * sxy - sx * sy) / den;
-  if (!Number.isFinite(b)) b = 1;
-  b = Math.min(CONST.elasticity_max, Math.max(CONST.elasticity_min, b));
-  const a = n > 0 ? (sy - b * sx) / n : 0;
-  const curveMultiple = (tvl: number): number => Math.exp(a) * Math.pow(Math.max(tvl, 1), b - 1);
-
-  const buckets = new Map<string, number[]>();
-  for (const p of comps) {
-    const rel = p.mcap_usd! / p.tvl_usd / curveMultiple(p.tvl_usd);
-    if (!Number.isFinite(rel) || rel <= 0) continue;
-    const key = catKey(p.category);
-    const arr = buckets.get(key) ?? [];
-    arr.push(rel);
-    buckets.set(key, arr);
-  }
-  const effects = new Map<string, Effect>();
-  for (const [key, arr] of buckets) {
-    if (arr.length < CONST.min_category_n) continue;
-    const raw = winsorizedMedian(arr);
-    const w = arr.length / (arr.length + CONST.shrink_k);
-    effects.set(key, { premium: (1 - w) * 1 + w * raw, n: arr.length });
-  }
-
-  const uncal = (tvl: number, category: string | null): number => {
-    const effect = effects.get(catKey(category));
-    const premium = effect ? effect.premium : 1;
-    return Math.max(tvl, 1) * curveMultiple(tvl) * premium;
-  };
-  const ratios = comps.map((p) => uncal(p.tvl_usd, p.category) / p.mcap_usd!);
-  const mid = median(ratios.filter((v) => Number.isFinite(v) && v > 0));
-  const scale = mid > 0 ? r6(1 / mid) : 1;
-  const multiples = comps.map((p) => p.mcap_usd! / p.tvl_usd);
-  return { a, b, scale, effects, globalMultiple: winsorizedMedian(multiples) };
-}
-
-function predictRaw(tvl: number, category: string | null, fit: Fit): { curve: number; fitted: number; premium: number; n: number } {
-  const curve = Math.exp(fit.a) * Math.pow(Math.max(tvl, 1), fit.b);
-  const effect = fit.effects.get(catKey(category));
-  const premium = effect ? effect.premium : 1;
-  const n = effect ? effect.n : 0;
-  const fitted = curve * premium * fit.scale;
-  return { curve, fitted, premium, n };
-}
-
-function predictMcap(tvl: number, category: string | null, fit: Fit): number {
-  return Math.max(1, predictRaw(tvl, category, fit).fitted);
-}
-
-function flatMultiple(comps: SnapshotProtocol[]): number {
-  const multiples = comps.map((p) => p.mcap_usd! / p.tvl_usd).filter((m) => Number.isFinite(m) && m > 0);
-  return multiples.length ? winsorizedMedian(multiples) : 0.2;
-}
-
-function leaveOneOut(comps: SnapshotProtocol[]): { mape: number; flat: number; ratio: number; n: number } {
-  const actual: number[] = [];
-  const pred: number[] = [];
-  const flatPred: number[] = [];
-  const ratios: number[] = [];
-  for (let i = 0; i < comps.length; i++) {
-    const held = comps[i]!;
-    const rest = comps.filter((_, j) => j !== i);
-    if (rest.length < 8) continue;
-    const fit = fitComps(rest);
-    const hat = predictMcap(held.tvl_usd, held.category, fit);
-    const flat = Math.max(1, held.tvl_usd * flatMultiple(rest));
-    actual.push(held.mcap_usd!);
-    pred.push(hat);
-    flatPred.push(flat);
-    ratios.push(hat / held.mcap_usd!);
-  }
-  return {
-    mape: medianAbsPct(actual, pred),
-    flat: medianAbsPct(actual, flatPred),
-    ratio: ratios.length ? median(ratios) : 1,
-    n: actual.length,
-  };
-}
-
-function walkForward(comps: SnapshotProtocol[]): { mape: number; flat: number; n: number } {
-  const dated = comps
-    .filter((p) => p.listed_at !== null && /^\d{4}-\d{2}-\d{2}$/.test(p.listed_at))
-    .sort((a, b) => cmpStr(a.listed_at!, b.listed_at!) || cmpStr(a.slug, b.slug));
-  if (dated.length < 16) return { mape: 1, flat: 1, n: 0 };
-  const cut = Math.floor(dated.length * 0.7);
-  const train = dated.slice(0, cut);
-  const test = dated.slice(cut);
-  if (train.length < 8 || test.length === 0) return { mape: 1, flat: 1, n: 0 };
-  const fit = fitComps(train);
-  const flat = flatMultiple(train);
-  const actual: number[] = [];
-  const pred: number[] = [];
-  const flatPred: number[] = [];
-  for (const p of test) {
-    actual.push(p.mcap_usd!);
-    pred.push(predictMcap(p.tvl_usd, p.category, fit));
-    flatPred.push(Math.max(1, p.tvl_usd * flat));
-  }
-  return { mape: medianAbsPct(actual, pred), flat: medianAbsPct(actual, flatPred), n: actual.length };
-}
-
-function quoteGas(chain: string): { setup: number; weekly: number; known: boolean } {
-  const hit = GAS_QUOTE[chain];
-  if (hit) return { setup: hit[0], weekly: hit[1], known: true };
-  return { setup: CONST.default_setup_usd, weekly: CONST.default_weekly_usd, known: false };
-}
-
-function monthScore(setup: number, weekly: number): number {
-  return setup + 4 * weekly;
-}
-
-function pickChain(chains: string[]): ChainChoice {
-  if (chains.length === 0) {
-    return {
-      chain: "the home chain",
-      primary: null,
-      only: true,
-      known: false,
-      setup: CONST.default_setup_usd,
-      weekly: CONST.default_weekly_usd,
-      primarySetup: CONST.default_setup_usd,
-    };
-  }
-  const primary = chains[0]!;
-  const primaryQuote = quoteGas(primary);
-  const primaryScore = monthScore(primaryQuote.setup, primaryQuote.weekly);
-  let best = primary;
-  let bestQuote = primaryQuote;
-  let bestScore = primaryScore;
-  for (let i = 1; i < chains.length; i++) {
-    const name = chains[i]!;
-    const q = quoteGas(name);
-    const score = monthScore(q.setup, q.weekly);
-    if (primaryScore - score >= CONST.chain_switch_usd && score < bestScore) {
+function pickChain(chains: string[]): { chain: string; gas: number; fund: number } {
+  const top = chains.slice(0, 3);
+  if (top.length === 0) return { chain: "its primary chain", gas: GAS_DEFAULT[0], fund: GAS_DEFAULT[1] };
+  let best = top[0]!;
+  let bestGas = gasOf(best)[0];
+  for (let i = 1; i < top.length; i++) {
+    const name = top[i]!;
+    const g = gasOf(name)[0];
+    if (g < bestGas) {
       best = name;
-      bestQuote = q;
-      bestScore = score;
+      bestGas = g;
     }
   }
-  return {
-    chain: best,
-    primary,
-    only: chains.length === 1,
-    known: bestQuote.known,
-    setup: r2(bestQuote.setup),
-    weekly: r2(bestQuote.weekly),
-    primarySetup: r2(primaryQuote.setup),
+  const quote = gasOf(best);
+  return { chain: best, gas: quote[0], fund: quote[1] };
+}
+
+function money(n: number): string {
+  if (!Number.isFinite(n)) return "$0";
+  const sign = n < 0 ? "-" : "";
+  const a = Math.abs(n);
+  if (a >= 1e9) return `${sign}$${(a / 1e9).toFixed(2)}B`;
+  if (a >= 1e6) return `${sign}$${(a / 1e6).toFixed(a >= 1e8 ? 0 : 1)}M`;
+  if (a >= 1000) return `${sign}$${String(Math.round(a)).replace(/\B(?=(\d{3})+(?!\d))/g, ",")}`;
+  if (a >= 100) return `${sign}$${a.toFixed(0)}`;
+  return `${sign}$${a.toFixed(2)}`;
+}
+
+function fitStep(text: string): string {
+  const t = text.replace(/\s+/g, " ").trim();
+  if (t.length > 600) return `${t.slice(0, 597).trimEnd()}...`;
+  if (t.length < 20) return `${t} Re-check the position before leaving it.`.slice(0, 600);
+  return t;
+}
+
+function categoryPremiums(train: VComp[], a: number, b: number): Map<string, number> {
+  const buckets = new Map<string, number[]>();
+  for (const t of train) {
+    const arr = buckets.get(t.cat) ?? [];
+    arr.push(t.ly - (a + b * t.x));
+    buckets.set(t.cat, arr);
+  }
+  const out = new Map<string, number>();
+  for (const [cat, arr] of buckets) {
+    if (arr.length < ECON.min_cat_n) continue;
+    const raw = median(arr);
+    out.set(cat, (arr.length / (arr.length + ECON.shrink_k)) * raw);
+  }
+  return out;
+}
+
+function fitValue(train: VComp[], spec: VSpec): VFit {
+  const flatMed = median(train.map((t) => t.mcap / t.tvl));
+  if (train.length < 8) {
+    return {
+      flat: flatMed, a: 0, b: 1, scale: 1, cat: new Map(), gCoef: 0, gMean: 0, ageCoef: 0, ageRef: 2.6,
+      chCoef: 0, chMean: 0, plCoef: 0, plMean: 0, spec,
+    };
+  }
+  const { a, b } = ols(train.map((t) => t.x), train.map((t) => t.ly));
+  const cat = spec.cat ? categoryPremiums(train, a, b) : new Map<string, number>();
+  const base = (t: VComp): number => a + b * t.x + (cat.get(t.cat) ?? 0);
+  const gMean = mean(train.map((t) => t.g));
+  const gCoef = spec.growth ? centeredSlope(train.map((t) => t.g), train.map((t) => t.ly - base(t))) : 0;
+  const afterG = (t: VComp): number => base(t) + gCoef * (t.g - gMean);
+  let ageCoef = 0;
+  let ageRef = 2.6;
+  if (spec.age) {
+    const dated = train.filter((t) => t.age !== null);
+    if (dated.length >= 8) {
+      const lx = dated.map((t) => log10(Math.max(30, t.age!)));
+      ageRef = median(lx);
+      ageCoef = centeredSlope(lx, dated.map((t) => t.ly - afterG(t)));
+    }
+  }
+  const ageLo = log10(ECON.age_clamp[0]);
+  const ageHi = log10(ECON.age_clamp[1]);
+  const ageEffect = (t: VComp): number => {
+    if (!spec.age) return 0;
+    const lage = log10(Math.max(30, t.age ?? ECON.age_unknown));
+    return clamp(ageCoef * (lage - ageRef), ageLo, ageHi);
   };
+  const chMean = mean(train.map((t) => Math.min(t.chains, 8)));
+  const chCoef = spec.chains
+    ? centeredSlope(train.map((t) => Math.min(t.chains, 8)), train.map((t) => t.ly - afterG(t) - ageEffect(t)))
+    : 0;
+  const afterC = (t: VComp): number => afterG(t) + ageEffect(t) + chCoef * (Math.min(t.chains, 8) - chMean);
+  const plMean = mean(train.map((t) => t.placebo));
+  const plCoef = spec.placebo
+    ? centeredSlope(train.map((t) => t.placebo), train.map((t) => t.ly - afterC(t)))
+    : 0;
+  const logRaw = (t: VComp): number => afterC(t) + plCoef * (t.placebo - plMean);
+  const ratios = train.map((t) => t.mcap / Math.pow(10, logRaw(t))).filter((v) => Number.isFinite(v) && v > 0);
+  const scale = median(ratios) || 1;
+  return { flat: null, a, b, scale, cat, gCoef, gMean, ageCoef, ageRef, chCoef, chMean, plCoef, plMean, spec };
 }
 
-function chainNote(choice: ChainChoice): string {
-  const open = money(choice.setup);
-  if (choice.primary === null) {
-    return `The snapshot names no chain, so the plan uses the mid gas quote of ${open} to open and ${money(choice.weekly)} a week.`;
+function predictMcap(fit: VFit, c: VComp): number {
+  if (fit.flat !== null) return Math.max(1, c.tvl * fit.flat);
+  const ageLo = log10(ECON.age_clamp[0]);
+  const ageHi = log10(ECON.age_clamp[1]);
+  let y = fit.a + fit.b * c.x + (fit.cat.get(c.cat) ?? 0);
+  y += fit.gCoef * (c.g - fit.gMean);
+  if (fit.spec.age) {
+    const lage = log10(Math.max(30, c.age ?? ECON.age_unknown));
+    y += clamp(fit.ageCoef * (lage - fit.ageRef), ageLo, ageHi);
   }
-  if (!choice.known) {
-    return `${choice.chain} has no specific gas quote, so the plan uses the mid default of ${open} to open and ${money(choice.weekly)} a week.`;
-  }
-  if (choice.only) return `${choice.chain} is the only chain listed, at about ${open} to open the position.`;
-  if (choice.chain === choice.primary) {
-    return `${choice.chain} is the first chain listed. Another chain would not save $${CONST.chain_switch_usd} over a month, so the plan stays there (about ${open} to open).`;
-  }
-  return `The first chain listed is ${choice.primary} (about ${money(choice.primarySetup)} to open). The plan uses ${choice.chain} instead, saving at least $${CONST.chain_switch_usd} over a month (about ${open} to open).`;
+  y += fit.chCoef * (Math.min(c.chains, 8) - fit.chMean);
+  y += fit.plCoef * (c.placebo - fit.plMean);
+  return Math.max(1, Math.pow(10, y) * fit.scale);
 }
 
-function capitalFor(tvl: number): number {
-  if (tvl >= 1_000_000_000) return 200;
-  if (tvl >= 250_000_000) return 120;
-  if (tvl >= 80_000_000) return 80;
-  if (tvl >= 20_000_000) return 50;
-  return 35;
+function missFactor(errors: number[]): number {
+  if (errors.length === 0) return 1;
+  return Math.pow(10, median(errors.map((e) => Math.abs(e))));
 }
 
-function holdDays(age: number | null): number {
-  if (age === null) return 28;
-  if (age < 180) return 56;
-  if (age < 540) return 42;
-  return 28;
+function looErrors(comps: VComp[], spec: VSpec, flat: boolean): number[] {
+  const errs: number[] = [];
+  for (let i = 0; i < comps.length; i++) {
+    const train = comps.filter((_, j) => j !== i);
+    const held = comps[i]!;
+    const fit = flat ? fitValue(train, EMPTY_SPEC) : fitValue(train, spec);
+    const pred = flat ? Math.max(1, held.tvl * (median(train.map((t) => t.mcap / t.tvl)) || 0.2)) : predictMcap(fit, held);
+    errs.push(log10(held.mcap) - log10(pred));
+  }
+  return errs;
 }
 
-function positionSentence(p: SnapshotProtocol, capital: number, choice: ChainChoice): string {
-  const usd = money(capital);
-  const name = p.name;
-  const chain = choice.chain;
-  const c = (p.category ?? "").toLowerCase();
-  if (c.includes("lend") || c.includes("cdp") || c.includes("collateral")) {
-    return `Supply ${usd} of USDC to ${name} on ${chain} and keep the receipt token.`;
+function wfErrors(comps: VComp[], spec: VSpec, flat: boolean): number[] {
+  const dated = comps.filter((c) => c.listed).sort((a, b) => cmp(a.listed, b.listed) || cmp(a.slug, b.slug));
+  const start = Math.max(12, Math.floor(dated.length * 0.55));
+  const errs: number[] = [];
+  for (let i = start; i < dated.length; i++) {
+    const train = dated.slice(0, i);
+    const held = dated[i]!;
+    const pred = flat
+      ? Math.max(1, held.tvl * (median(train.map((t) => t.mcap / t.tvl)) || 0.2))
+      : predictMcap(fitValue(train, spec), held);
+    errs.push(log10(held.mcap) - log10(pred));
   }
-  if (c.includes("dex") || c.includes("liquidity")) {
-    return `Add ${usd} of balanced liquidity to the deepest ${name} pool on ${chain} and keep the LP receipt.`;
-  }
-  if (c.includes("yield") || c.includes("farm") || c.includes("leveraged")) {
-    return `Deposit ${usd} into the main ${name} yield vault on ${chain} and keep the shares.`;
-  }
-  if (c.includes("curator") || c.includes("allocator") || c.includes("risk")) {
-    return `Deposit ${usd} into a ${name} vault on ${chain} and keep the shares.`;
-  }
-  if (c.includes("basis") || c.includes("perpetual") || c.includes("derivative")) {
-    return `Post ${usd} of USDC as margin on ${name} on ${chain} and open one small hedged position.`;
-  }
-  if (c.includes("prediction")) return `Fund ${name} with ${usd} on ${chain} and take one market position.`;
-  if (c.includes("stable") || c.includes("cdp")) return `Mint or deposit ${usd} of the stable asset through ${name} on ${chain} and hold it.`;
-  if (c.includes("rwa")) return `Buy ${usd} of the ${name} yield asset on ${chain} and hold the position.`;
-  if (c.includes("insur")) return `Buy ${usd} of cover from ${name} on ${chain} and keep the policy.`;
-  if (c.includes("privacy")) return `Route ${usd} through ${name} on ${chain} and leave a small balance in the app.`;
-  if (c.includes("staking") || c.includes("restak")) {
-    return `Stake ${usd} of the chain asset through ${name} on ${chain} and keep the receipt.`;
-  }
-  if (c.includes("bridge")) return `Bridge ${usd} of USDC with ${name} onto ${chain} and use the funds in its app.`;
-  if (c.includes("launch")) return `Commit ${usd} to one open ${name} sale or pool on ${chain} and keep the receipt.`;
-  return `Deposit ${usd} of USDC into ${name} on ${chain} and keep the position open.`;
+  return errs;
 }
 
-function activeFarmers(tvl: number): number {
-  const ratio = Math.max(tvl, 1_000_000) / 1_000_000;
-  return Math.max(CONST.farmer_floor, Math.round(CONST.farmer_scale * Math.pow(ratio, CONST.farmer_power)));
+function foldOf(slug: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < slug.length; i++) h = Math.imul(h ^ slug.charCodeAt(i), 16777619);
+  return (h >>> 0) % 5;
 }
 
-function decide(
-  dph: number,
-  net: number,
-  change: number | null,
-): { verdict: "farm" | "thin" | "skip"; reason: string } {
-  if (change !== null && change <= CONST.crash_7d) {
-    return {
-      verdict: "skip",
-      reason: `Seven-day TVL is ${change.toFixed(1)}%, past ${CONST.crash_7d}%, so the plan skips until the book stabilizes.`,
-    };
+function familyTable(peers: Peer[]): Map<string, number> {
+  const global = mean(peers.map((p) => p.y));
+  const sum = new Map<string, { n: number; s: number }>();
+  for (const p of peers) {
+    const cur = sum.get(p.cat) ?? { n: 0, s: 0 };
+    cur.n += 1;
+    cur.s += p.y;
+    sum.set(p.cat, cur);
   }
-  const soft = change !== null && change <= CONST.farm_growth_floor;
-  if (dph >= CONST.farm_dph && net >= CONST.farm_net_usd && !soft) {
-    return {
-      verdict: "farm",
-      reason: `Net is about $${dph} an hour after gas (${money(net)} over the work), and seven-day TVL is not below ${CONST.farm_growth_floor}%.`,
-    };
+  const out = new Map<string, number>();
+  for (const [cat, cur] of sum) out.set(cat, (cur.s + ECON.fam_k * global) / (cur.n + ECON.fam_k) - global);
+  return out;
+}
+
+function design(row: Peer, spec: OSpec, fam: Map<string, number>): number[] {
+  const x = [1];
+  if (spec.age) x.push(row.lage);
+  if (spec.fam) x.push(fam.get(row.cat) ?? 0);
+  if (spec.tvl) x.push(row.ltvl);
+  if (spec.growth) x.push(row.g);
+  if (spec.chains) x.push(row.chf);
+  if (spec.placebo) x.push(row.placebo);
+  return x;
+}
+
+function oddsNames(spec: OSpec): string[] {
+  const names = ["intercept"];
+  if (spec.age) names.push("age");
+  if (spec.fam) names.push("family");
+  if (spec.tvl) names.push("size");
+  if (spec.growth) names.push("growth");
+  if (spec.chains) names.push("chains");
+  if (spec.placebo) names.push("placebo");
+  return names;
+}
+
+function fitOdds(peers: Peer[], spec: OSpec): { weights: number[]; fam: Map<string, number> } {
+  const fam = familyTable(peers);
+  const X = peers.map((p) => design(p, spec, fam));
+  return { weights: fitLogit(X, peers.map((p) => p.y)), fam };
+}
+
+function probOf(fit: { weights: number[]; fam: Map<string, number> }, row: Peer, spec: OSpec): number {
+  const x = design(row, spec, fit.fam);
+  let z = 0;
+  for (let i = 0; i < fit.weights.length; i++) z += fit.weights[i]! * x[i]!;
+  return sigmoid(z);
+}
+
+function brierCV(peers: Peer[], spec: OSpec): number {
+  let sse = 0;
+  for (let f = 0; f < 5; f++) {
+    const train = peers.filter((p) => foldOf(p.slug) !== f);
+    const test = peers.filter((p) => foldOf(p.slug) === f);
+    const fit = fitOdds(train, spec);
+    for (const row of test) {
+      const e = probOf(fit, row, spec) - row.y;
+      sse += e * e;
+    }
   }
-  if (dph >= CONST.thin_dph && net >= CONST.thin_net_usd) {
-    return {
-      verdict: "thin",
-      reason: `Net is about $${dph} an hour after gas, enough for a small position, short of the $${CONST.farm_dph} an hour farm line.`,
-    };
+  return sse / peers.length;
+}
+
+function brierWF(peers: Peer[], spec: OSpec): number {
+  const dated = peers.filter((p) => p.listed).sort((a, b) => cmp(a.listed, b.listed) || cmp(a.slug, b.slug));
+  const cut = Math.floor(dated.length * 0.6);
+  const train = dated.slice(0, cut).concat(peers.filter((p) => !p.listed));
+  const test = dated.slice(cut);
+  if (train.length < 20 || test.length === 0) return 0.25;
+  const fit = fitOdds(train, spec);
+  let sse = 0;
+  for (const row of test) {
+    const e = probOf(fit, row, spec) - row.y;
+    sse += e * e;
   }
-  if (net < CONST.thin_net_usd) {
-    return {
-      verdict: "skip",
-      reason: `After gas the position nets ${money(net)}, under the $${CONST.thin_net_usd} thin line.`,
-    };
-  }
-  return {
-    verdict: "skip",
-    reason: `About $${dph} an hour after gas, under the $${CONST.thin_dph} an hour thin line.`,
-  };
+  return sse / test.length;
 }
 
-export function joinStep(step: FarmStep): string {
-  let s = `${step.text} Cost: ${step.cost}. Time: ${step.time}.`.replace(/\s+/g, " ").trim();
-  if (s.length > 600) s = `${s.slice(0, 596).trimEnd()}...`;
-  if (s.length < 20) s = `${s} Hold the position and re-check the protocol site.`;
-  return s;
-}
-
-function growthOf(change: number | null): { pct: number; mult: number } {
-  const pct = Math.min(CONST.growth_cap, Math.max(CONST.growth_floor, finite(change, 0)));
-  return { pct: r4(pct), mult: r4(1 + (pct / 100) * CONST.growth_weight) };
-}
-
-function maturityOf(age: number | null): number {
-  const days = age ?? CONST.unknown_age_days;
-  const t = Math.min(Math.max(days, 0), CONST.maturity_days) / CONST.maturity_days;
-  return r4(CONST.maturity_floor + CONST.maturity_span * t);
-}
-
-interface Scored {
+interface ScoredProto {
   protocol: SnapshotProtocol;
-  onWatchlist: boolean;
+  tier: "watchlist" | "early" | "off-list";
   age: number | null;
-  row: RadarRow;
-  board: Omit<BoardRow, "rank" | "farm_steps"> & { steps: FarmStep[] };
+  g: number;
+  placebo: number;
+  peer: Peer;
 }
 
-function scoreProtocol(p: SnapshotProtocol, asOf: string, fit: Fit, onWatchlist: boolean): Scored {
-  const age = ageDays(asOf, p.listed_at);
-  const raw = predictRaw(p.tvl_usd, p.category, fit);
-  const growth = growthOf(p.change_7d);
-  const maturity = maturityOf(age);
-  const implied = dollars(raw.fitted * growth.mult * maturity);
-  const choice = pickChain(p.chains);
-  const note = chainNote(choice);
-  const capital = capitalFor(p.tvl_usd);
-  const hold = holdDays(age);
-  const weeks = Math.max(1, Math.ceil(hold / 7));
-  const setup = choice.setup;
-  const weekly = choice.weekly;
-  const gas = r2(setup + weekly * weeks);
-  const hours = r2((CONST.setup_minutes + weeks * CONST.weekly_minutes + CONST.claim_minutes) / 60);
-  const farmers = activeFarmers(p.tvl_usd);
-  const pool = r2(implied * CONST.pool_frac);
-  const weight = r4(Math.sqrt(capital / CONST.weight_base) * (CONST.weight_floor + Math.min(weeks, CONST.weight_week_cap) * CONST.weight_per_week));
-  const ceiling = Math.max(CONST.capture_floor_usd, capital * CONST.capture_capital_multiple);
-  const rawCapture = farmers > 0 ? (pool / farmers) * weight : 0;
-  const capped = rawCapture > ceiling;
-  const capture = r2(Math.min(ceiling, Math.max(0, rawCapture)));
-  const net = r2(capture - gas);
-  const dph = hours > 0 ? Math.round(net / hours) : 0;
-  const breakEven = capture > 0 ? r2((gas / capture) * 100) : 999;
-  const decision = decide(dph, net, p.change_7d);
-  const curve = dollars(raw.curve);
-  const fitted = dollars(raw.fitted);
-  const multiple = p.tvl_usd > 0 ? r6(fitted / p.tvl_usd) : 0;
+function planNumbers(
+  tvl: number,
+  implied: number,
+  change: number | null,
+  play: string,
+  chain: { gas: number; fund: number },
+  deposit: number,
+  share: number,
+  weeks: number,
+): RadarRow["plan"] {
+  const how = PLAYS[play] ?? PLAYS.use!;
+  const fees = c2(chain.fund + chain.gas * (how.txIn + weeks * how.txWeek + how.txOut));
+  const capture = c2((implied * share * deposit) / (tvl + deposit));
+  const minutes = how.minIn + weeks * how.minWeek + how.minOut;
+  const hours = c2(minutes / 60);
+  const net = c2(capture - fees);
+  const tbill = c2(deposit * ECON.tbill * (weeks * 7) / 365);
+  const dph = hours > 0 ? c2(net / hours) : 0;
+  let verdict: "farm" | "thin" | "skip" = "skip";
+  if (change !== null && change <= ECON.crash) verdict = "skip";
+  else if (!(net > 0)) verdict = "skip";
+  else if (net > tbill && dph >= ECON.farm_dph) verdict = "farm";
+  else verdict = "thin";
+  return { deposit, share, weeks, capture, fees, hours, net, tbill, dph, verdict };
+}
 
-  const farmerLabel = String(farmers).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-  const steps: FarmStep[] = [
-    {
-      text: `Open a new wallet that will only farm ${p.name}. Fund it with ${money(capital)} plus gas, and keep the seed phrase offline.`,
-      cost: "wallet software is free; the funding transfer is usually under $1",
-      time: "5 minutes",
-    },
-    {
-      text: `${positionSentence(p, capital, choice)} ${note}`,
-      cost: `${money(capital)} stays in the position and can be withdrawn; about ${money(setup)} of gas is spent to open it`,
-      time: `${CONST.setup_minutes} minutes`,
-    },
-    {
-      text: `Once a week for ${weeks} weeks, send one small transaction on ${choice.chain} (a swap, a claim, or a vote) so the wallet is active on ${weeks} separate weeks.`,
-      cost: `about ${money(weekly)} of gas a week, ${money(r2(weekly * weeks))} across ${weeks} weeks`,
-      time: `${CONST.weekly_minutes} minutes a week`,
-    },
-    {
-      text: `Leave the position open for ${hold} days. ${money(capital)} is locked and comes back when you exit; the ${money(gas)} of gas does not. Active work is about ${hours.toFixed(2)} hours.`,
-      cost: `${money(gas)} of gas spent, ${money(capital)} of capital returned on exit`,
-      time: `${hold} days on the clock, ${hours.toFixed(2)} hours of work`,
-    },
-    {
-      text: `Save each transaction hash. When you exit, claim points only on the site ${p.name} publishes. Do not send funds to a claim page that arrives in a message.`,
-      cost: "reading the claim page is free; never pay a fee to claim",
-      time: `${CONST.claim_minutes} minutes`,
-    },
-    {
-      text: `Modeled capture is ${money(capture)}${capped ? " after the cap" : ""}: ${(CONST.pool_frac * 100).toFixed(2)}% of the ${money(implied)} implied value (${money(pool)} pool) split across ${farmerLabel} active wallets, times a ${weight.toFixed(2)} weight. Gas of ${money(gas)} is ${breakEven}% of that capture. Net ${money(net)}, about $${dph} an hour. Verdict: ${decision.verdict}. ${decision.reason}`,
-      cost: `${money(gas)} of gas against ${money(capture)} modeled capture`,
-      time: `${hours.toFixed(2)} hours`,
-    },
+function sentences(p: SnapshotProtocol, play: string, chain: string, deposit: number): { enter: string; qualify: string; watch: string; stop: string } {
+  const dep = money(deposit);
+  const quarter = money(deposit / 4);
+  const nm = p.name;
+  if (play === "lend") {
+    return {
+      enter: `Supply ${dep} of USDC to ${nm} on ${chain} and keep the receipt token in this wallet.`,
+      qualify: `Borrow ${quarter} of a stablecoin against it so both sides stay open, and keep the health factor above 2.`,
+      watch: `check the health factor and the supply rate on ${nm}.`,
+      stop: `health nears 1.5 or utilisation sits at 100%`,
+    };
+  }
+  if (play === "lp") {
+    return {
+      enter: `Add ${dep} to ${nm}'s deepest pool on ${chain}, in its busiest pair, and keep the LP receipt.`,
+      qualify: `Stake the receipt in ${nm}'s own gauge or rewards contract if it has one; a third-party farm does not count.`,
+      watch: `swap about ${money(deposit / 10)} through ${nm}'s own router and record the fee.`,
+      stop: `impermanent loss on the position passes 2%`,
+    };
+  }
+  if (play === "perp") {
+    return {
+      enter: `Deposit ${dep} of USDC as margin on ${nm} on ${chain}. Do not lever past 1x.`,
+      qualify: `Open and close one ${dep} round trip on a major pair so the week counts as active volume.`,
+      watch: `do one round trip and write down fees and funding.`,
+      stop: `fees plus funding pass 3% of the margin`,
+    };
+  }
+  if (play === "rwa") {
+    return {
+      enter: `Buy ${dep} of ${nm}'s tokenised asset on ${chain} and read the redemption notice before sending funds.`,
+      qualify: `Complete ${nm}'s allowlist or KYC with this wallet if it asks, and wait until the wallet is cleared.`,
+      watch: `check NAV and the redemption queue.`,
+      stop: `redemptions pause or NAV is marked down`,
+    };
+  }
+  if (play === "stake") {
+    return {
+      enter: `Stake ${dep} of the asset ${nm} accepts on ${chain} and note the unbonding period first.`,
+      qualify: `Delegate to an operator ${nm} lists, and keep the receipt in this wallet.`,
+      watch: `check the operator and the reward rate.`,
+      stop: `the operator is slashed or the exit queue runs past a week`,
+    };
+  }
+  if (play === "vault") {
+    return {
+      enter: `Deposit ${dep} of USDC into ${nm}'s main vault on ${chain} and keep the vault shares in this wallet.`,
+      qualify: `Connect the same wallet to ${nm}'s points or referral page in week one, if it has one, and leave the shares put.`,
+      watch: `note the share price and the vault TVL.`,
+      stop: `the share price falls while the underlying asset is flat`,
+    };
+  }
+  return {
+    enter: `Move ${dep} into ${nm} on ${chain} through its own app, so the activity sits on this wallet.`,
+    qualify: `Do one real action the app scores (a deposit, a swap, or a contract call) and leave the position open.`,
+    watch: `repeat one real action and record the fee.`,
+    stop: `withdrawals pause or the app stops crediting the wallet`,
+  };
+}
+
+function buildSteps(p: SnapshotProtocol, play: string, chainName: string, chain: { gas: number }, plan: RadarRow["plan"], implied: number): string[] {
+  const how = PLAYS[play] ?? PLAYS.use!;
+  const talk = sentences(p, play, chainName, plan.deposit);
+  const weeks = plan.weeks;
+  const hold = weeks * 7;
+  const gasBudget = c2(chain.gas * (how.txIn + weeks * how.txWeek + how.txOut));
+  const weekGas = c2(chain.gas * how.txWeek);
+  const label = plan.verdict === "farm" ? "FARM" : plan.verdict === "thin" ? "MARGINAL" : "SKIP";
+  const lines = [
+    `Setup: Create a fresh wallet used only to farm ${p.name}. Write the seed on paper and keep it offline. Do not reuse a wallet that already holds savings. Cost: nothing. Time: 10 minutes.`,
+    `Verify: Find ${p.name} by the slug ${p.slug} on DefiLlama, open the app it links, and match the contract addresses. Confirm the record still shows no token, and read any points page before funding. Cost: nothing. Time: 12 minutes.`,
+    `Fund: Withdraw ${money(plan.deposit)} of USDC (or the asset ${p.name} takes) plus ${money(gasBudget)} for gas to that wallet on ${chainName}. The exchange withdrawal is about ${money(plan.fees - gasBudget > 0 ? c2(plan.fees - gasBudget) : chain.gas)}. Cost: ${money(c2(plan.fees - gasBudget))}. Time: 10 minutes, plus the transfer.`,
+    `Enter: ${talk.enter} Cost: ${money(c2(chain.gas * how.txIn))} of gas across ${how.txIn} transactions. Time: ${how.minIn} minutes.`,
+    `Qualify: ${talk.qualify} Cost: ${money(chain.gas)} if this takes its own transaction, else nothing. Time: 10 minutes.`,
+    `Cadence: Once a week for ${weeks} weeks, ${talk.watch} That is ${weeks} separate weeks, about ${how.minWeek} minutes and ${money(weekGas)} of gas each week. Cost: ${money(c2(weekGas * weeks))}. Time: ${how.minWeek * weeks} minutes over ${hold} days.`,
+    `Stop: Leave early if ${talk.stop}, if TVL prints under ${money(p.tvl_usd * 0.7)} (30% below the ${money(p.tvl_usd)} in this snapshot), or if a token is announced with nothing set aside for current depositors. Cost: nothing. Time: 5 minutes a week.`,
+    `Claim: If a token is issued, claim only inside ${p.name}'s own app from this wallet. Never pay a stranger to claim, and never sign a message that arrives in a DM. At an implied ${money(implied)} and a ${(plan.share * 100).toFixed(1)}% drop share, this deposit's modelled slice is ${money(plan.capture)}. Cost: about ${money(chain.gas)}. Time: 15 minutes.`,
+    `Exit: After ${hold} days, or at the claim, unwind on ${chainName}, revoke approvals, and send the funds back to the exchange. Fees are ${money(plan.fees)} all-in. The same ${money(plan.deposit)} in a 4% T-bill for ${weeks} weeks is ${money(plan.tbill)}. Net of fees is ${money(plan.net)}, about ${money(plan.dph)} an hour. Verdict: ${label}. Cost: ${money(c2(chain.gas * how.txOut))}. Time: 12 minutes.`,
   ];
-
-  const row: RadarRow = {
-    rank: 0,
-    slug: p.slug,
-    name: p.name,
-    category: p.category,
-    chains: p.chains,
-    tvl_usd: p.tvl_usd,
-    change_7d: p.change_7d,
-    listed_at: p.listed_at,
-    age_days: age,
-    on_watchlist: onWatchlist,
-    implied_value_usd: implied,
-    curve_mcap_usd: curve,
-    fitted_mcap_usd: fitted,
-    fitted_multiple: multiple,
-    category_premium: r4(raw.premium),
-    category_n: raw.n,
-    growth_pct: growth.pct,
-    growth_multiplier: growth.mult,
-    maturity_multiplier: maturity,
-    farm_chain: choice.chain,
-    farm_chain_note: note,
-    farm_capital_usd: capital,
-    farm_gas_usd: gas,
-    farm_hours: hours,
-    farm_setup_usd: setup,
-    farm_weekly_usd: weekly,
-    farm_weeks: weeks,
-    farm_hold_days: hold,
-    capture_usd: capture,
-    capture_capped: capped,
-    active_farmers: farmers,
-    position_weight: weight,
-    pool_usd: pool,
-    net_usd: net,
-    dollars_per_hour: dph,
-    break_even_pct: breakEven,
-    verdict: decision.verdict,
-    verdict_reason: decision.reason,
-    steps,
-  };
-
-  return {
-    protocol: p,
-    onWatchlist,
-    age,
-    row,
-    board: {
-      slug: p.slug,
-      name: p.name,
-      category: p.category,
-      chains: p.chains,
-      tvl_usd: p.tvl_usd,
-      change_7d: p.change_7d,
-      listed_at: p.listed_at,
-      age_days: age,
-      token_status: "pre-token",
-      on_watchlist: onWatchlist,
-      implied_value_usd: implied,
-      model: {
-        curve_mcap_usd: curve,
-        fitted_mcap_usd: fitted,
-        fitted_multiple: multiple,
-        category_premium: r4(raw.premium),
-        category_n: raw.n,
-        growth_pct: growth.pct,
-        growth_multiplier: growth.mult,
-        maturity_multiplier: maturity,
-        farm_chain: choice.chain,
-        farm_capital_usd: capital,
-        farm_gas_usd: gas,
-        farm_hours: hours,
-        capture_usd: capture,
-        net_usd: net,
-        dollars_per_hour: dph,
-        break_even_pct: breakEven,
-        verdict: decision.verdict,
-      },
-      steps,
-    },
-  };
+  return lines.map(fitStep);
 }
 
-function buildFitReport(snapshot: Snapshot, comps: SnapshotProtocol[], fit: Fit): FitReport {
-  const loo = leaveOneOut(comps);
-  const wf = walkForward(comps);
-  const liveWithMcap = snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0).length;
-  const categories = [...fit.effects.entries()]
-    .map(([category, effect]) => ({
-      category,
-      n: effect.n,
-      premium: r4(effect.premium),
-      multiple_at_100m: r6(predictMcap(100_000_000, category, fit) / 100_000_000),
-    }))
-    .sort((a, b) => b.n - a.n || cmpStr(a.category, b.category));
-  return {
-    comps_used: comps.length,
-    comps_excluded: liveWithMcap - comps.length,
-    categories_fit: categories.length,
-    size_a: r6(fit.a),
-    size_b: r6(fit.b),
-    scale: fit.scale,
-    global_multiple: r6(predictMcap(100_000_000, null, fit) / 100_000_000),
-    raw_median_multiple: r6(fit.globalMultiple),
-    loo_mape: r4(loo.mape),
-    loo_flat_mape: r4(loo.flat),
-    loo_median_ratio: r4(loo.ratio),
-    loo_n: loo.n,
-    wf_mape: r4(wf.mape),
-    wf_flat_mape: r4(wf.flat),
-    wf_n: wf.n,
-    beats_flat: wf.n >= 8 && wf.mape < wf.flat && loo.mape <= loo.flat,
-    categories,
-  };
+function checksumOf(rows: { slug: string; rank: number; implied_value_usd: number }[]): string {
+  let h = 2166136261;
+  const s = rows.map((r) => `${r.slug}|${r.rank}|${r.implied_value_usd}`).join("\n");
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619) >>> 0;
+  return (h >>> 0).toString(16).padStart(8, "0");
 }
 
-function buildNote(fit: FitReport): { blurb: string; note: string; assumptions: string } {
-  const beat = fit.beats_flat
-    ? "The curve beats a flat multiple on both checks."
-    : "A flat multiple is closer on at least one check.";
-  const blurb = `Fitted on ${fit.comps_used} live comps. Market cap scales as TVL^${fit.size_b}. Leave-one-out error ${pctText(fit.loo_mape)} versus ${pctText(fit.loo_flat_mape)} flat. Walk-forward ${pctText(fit.wf_mape)} versus ${pctText(fit.wf_flat_mape)} flat. ${beat}`;
-  const note = [
-    "Implied value is the fitted market cap times a growth factor times a maturity factor.",
-    `The fit is log market cap on log TVL (elasticity ${fit.size_b}) plus a category premium shrunk toward 1 with weight n/(n+${CONST.shrink_k}), estimated on ${fit.comps_used} tokens that already trade, with a market-cap multiple between ${CONST.min_mult} and ${CONST.max_mult}.`,
-    `${fit.comps_excluded} other tokens with a market cap are left out of the fit (bridge, liquid staking, restaking, CEX, wrapped or staked names, or a multiple outside that band).`,
-    `Predictions are scaled by ${fit.scale} so the median training comp matches its own market cap.`,
-    `Growth is 1 + ${CONST.growth_weight} times the seven-day TVL change clipped to [${CONST.growth_floor}%, ${CONST.growth_cap}%]. A missing change counts as zero.`,
-    `Maturity runs from ${CONST.maturity_floor} on the listing day to ${r4(CONST.maturity_floor + CONST.maturity_span)} after ${CONST.maturity_days} days. An unknown listing date uses ${CONST.unknown_age_days} days.`,
-    `Leave-one-out median absolute error is ${pctText(fit.loo_mape)} on ${fit.loo_n} comps, against ${pctText(fit.loo_flat_mape)} for a flat multiple. Median predicted/actual is ${fit.loo_median_ratio}.`,
-    `Walk-forward trains on protocols DefiLlama listed earlier and scores the ones it listed later: ${pctText(fit.wf_mape)} versus ${pctText(fit.wf_flat_mape)} flat (n=${fit.wf_n}).`,
-    beat,
-    "The board ranks protocols whose record has no token. Tokens that already trade are the comps, and they are not ranked.",
-  ].join(" ");
-  const assumptions = `Pool = ${(CONST.pool_frac * 100).toFixed(2)}% of implied value ÷ max(${CONST.farmer_floor}, ${CONST.farmer_scale}×(TVL/$1M)^${CONST.farmer_power}) × sqrt(capital/$${CONST.weight_base}) × (${CONST.weight_floor} + ${CONST.weight_per_week}×weeks), capped at max(${money(CONST.capture_floor_usd)}, ${CONST.capture_capital_multiple}× capital). Capital is returned; gas is the cost. Farm is at least $${CONST.farm_dph}/hour and $${CONST.farm_net_usd} net, with 7-day TVL above ${CONST.farm_growth_floor}%. Thin is at least $${CONST.thin_dph}/hour and $${CONST.thin_net_usd} net. A ${CONST.crash_7d}% week is a skip. This does not say a token will be issued.`;
-  return { blurb, note, assumptions };
-}
-
-export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: RadarData } {
-  const comps = snapshot.protocols.filter(isComp);
-  const fit = fitComps(comps);
-  const report = buildFitReport(snapshot, comps, fit);
-  const copy = buildNote(report);
-  const index = new Map(snapshot.protocols.map((p) => [p.slug, p]));
+function ledgerBuckets(
+  snapshot: Snapshot,
+  compSlugs: Set<string>,
+): { id: string; label: string; n: number; note: string; color: string }[] {
   const watch = new Set(snapshot.watchlist);
-  const chosen: SnapshotProtocol[] = [];
-  const seen = new Set<string>();
-  for (const slug of snapshot.watchlist) {
-    const p = index.get(slug);
-    if (p !== undefined && !seen.has(slug)) {
-      chosen.push(p);
-      seen.add(slug);
+  const counts = new Map<string, number>();
+  const bump = (id: string): void => counts.set(id, (counts.get(id) ?? 0) + 1);
+  for (const p of snapshot.protocols) {
+    const noToken = recordsNoToken(p);
+    if (noToken && watch.has(p.slug)) bump("watch");
+    else if (noToken && !houseOut(p) && p.tvl_usd >= snapshot.floor_usd) bump("offlist");
+    else if (noToken && !houseOut(p)) bump("early");
+    else if (tokenTrades(p) && compSlugs.has(p.slug)) bump("comp");
+    else if (tokenTrades(p) || tokenOnRecord(p)) bump("recorded");
+    else if (bridgeCat(p)) bump("bridge");
+    else if (lstCat(p)) bump("lst");
+    else if (exchangeish(p)) bump("exchange");
+    else if (wrappedName(p)) bump("wrapped");
+    else bump("other");
+  }
+  const spec: { id: string; label: string; note: string; color: string }[] = [
+    { id: "watch", label: "Ranked · watchlist", note: "no token on record, at or above the floor, on the house list", color: "#2dd4bf" },
+    { id: "early", label: "Ranked · early, below the floor", note: "no token, clears the house rules, TVL under the floor", color: "#60a5fa" },
+    { id: "offlist", label: "Ranked · off-list, above the floor", note: "no token and above the floor, left off the list (a parent listing)", color: "#e8b84a" },
+    { id: "comp", label: "Token trades · priced comp", note: "market cap inside the comp screen, used to fit the curve", color: "#f59e0b" },
+    { id: "recorded", label: "Token on record · no usable cap", note: "a ticker or a cap outside the comp screen", color: "#94a3b8" },
+    { id: "bridge", label: "Out · bridge", note: "no token, bridge category", color: "#a78bfa" },
+    { id: "lst", label: "Out · liquid staking", note: "no token, liquid staking or restaked BTC", color: "#c084fc" },
+    { id: "exchange", label: "Out · exchange", note: "no token, CEX category or an exchange name", color: "#fb7185" },
+    { id: "wrapped", label: "Out · versioned or wrapped", note: "no token, versioned name or wrapped or staked wording", color: "#f97316" },
+    { id: "other", label: "Out · other", note: "no token, and none of the buckets above", color: "#64748b" },
+  ];
+  return spec.filter((s) => (counts.get(s.id) ?? 0) > 0 || s.id !== "other").map((s) => ({ ...s, n: counts.get(s.id) ?? 0 }));
+}
+
+export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Record<string, unknown> } {
+  const asOf = snapshot.as_of;
+  const placebo = new Map<string, number>();
+  const ordered = [...snapshot.protocols].sort((a, b) => cmp(a.slug, b.slug));
+  for (let i = 0; i < ordered.length; i++) {
+    const next = ordered[(i + 1) % ordered.length]!;
+    placebo.set(ordered[i]!.slug, growthOf(next.change_7d));
+  }
+
+  const peers: Peer[] = ordered.map((p) => {
+    const age = ageDays(asOf, p.listed_at);
+    return {
+      slug: p.slug,
+      cat: p.category ?? "Uncategorized",
+      y: tokenTrades(p) || tokenOnRecord(p) ? 1 : 0,
+      tvl: p.tvl_usd,
+      g: growthOf(p.change_7d),
+      age,
+      listed: p.listed_at ?? "",
+      chains: p.chains.length,
+      placebo: placebo.get(p.slug) ?? 0,
+      ltvl: log10(Math.max(1, p.tvl_usd)) - 7.2,
+      lage: log10(Math.max(30, age ?? ECON.age_unknown)) - 2.6,
+      chf: Math.min(p.chains.length, 6) - 1,
+    };
+  });
+  const peerBySlug = new Map(peers.map((p) => [p.slug, p]));
+
+  const comps: VComp[] = [];
+  for (const p of ordered) {
+    if (!tokenTrades(p) || houseOut(p)) continue;
+    const mult = p.mcap_usd! / p.tvl_usd;
+    if (mult < ECON.min_multiple || mult > ECON.max_multiple) continue;
+    if (Math.abs(mult - 1) <= ECON.receipt_band) continue;
+    const age = ageDays(asOf, p.listed_at);
+    comps.push({
+      slug: p.slug,
+      cat: p.category ?? "Uncategorized",
+      tvl: p.tvl_usd,
+      mcap: p.mcap_usd!,
+      x: log10(p.tvl_usd),
+      ly: log10(p.mcap_usd!),
+      g: growthOf(p.change_7d),
+      age,
+      listed: p.listed_at ?? "",
+      chains: p.chains.length,
+      placebo: placebo.get(p.slug) ?? 0,
+    });
+  }
+
+  const flatLoo = missFactor(looErrors(comps, EMPTY_SPEC, true));
+  const flatWf = missFactor(wfErrors(comps, EMPTY_SPEC, true));
+  const sizeLoo = missFactor(looErrors(comps, EMPTY_SPEC, false));
+  const sizeWf = missFactor(wfErrors(comps, EMPTY_SPEC, false));
+  const valueTerms: TermRow[] = [
+    { name: "Flat median multiple", loo: r4(flatLoo), wf: r4(flatWf), kept: false, note: "baseline" },
+  ];
+  let spec: VSpec = { ...EMPTY_SPEC };
+  const sizeKept = sizeLoo < flatLoo - ECON.keep_miss && sizeWf < flatWf - ECON.keep_miss;
+  valueTerms.push({
+    name: "Size curve, log TVL",
+    loo: r4(sizeLoo),
+    wf: r4(sizeWf),
+    kept: sizeKept,
+    note: sizeKept ? "kept" : "tested, not kept",
+  });
+  let curLoo = sizeKept ? sizeLoo : flatLoo;
+  let curWf = sizeKept ? sizeWf : flatWf;
+  const candidates: { key: keyof VSpec; name: string }[] = [
+    { key: "cat", name: "Category premium, shrunk" },
+    { key: "growth", name: "7-day TVL growth" },
+    { key: "age", name: "Years listed" },
+    { key: "chains", name: "Chain count" },
+    { key: "placebo", name: "Placebo: another row's week" },
+  ];
+  for (const cand of candidates) {
+    const next: VSpec = { ...spec, [cand.key]: true };
+    const loo = missFactor(looErrors(comps, next, false));
+    const wf = missFactor(wfErrors(comps, next, false));
+    const kept = sizeKept && loo < curLoo - ECON.keep_miss && wf < curWf - ECON.keep_miss;
+    valueTerms.push({ name: cand.name, loo: r4(loo), wf: r4(wf), kept, note: kept ? "kept" : "tested, not kept" });
+    if (kept) {
+      spec = next;
+      curLoo = loo;
+      curWf = wf;
     }
   }
-  const extras = snapshot.protocols.filter((p) => !seen.has(p.slug) && isRankable(p));
-  extras.sort((a, b) => cmpStr(a.slug, b.slug));
-  for (const p of extras) chosen.push(p);
 
-  const scored = chosen.map((p) => scoreProtocol(p, snapshot.as_of, fit, watch.has(p.slug)));
-  scored.sort((a, b) => b.row.implied_value_usd - a.row.implied_value_usd || cmpStr(a.row.slug, b.row.slug));
+  const pricing = fitValue(comps, spec);
+  const alt = {
+    cat: fitValue(comps, { ...spec, cat: true }),
+    growth: fitValue(comps, { ...spec, growth: true }),
+    age: fitValue(comps, { ...spec, age: true }),
+    chains: fitValue(comps, { ...spec, chains: true }),
+    placebo: fitValue(comps, { ...spec, placebo: true }),
+  };
 
-  const board: BoardRow[] = scored.map((s, i) => ({
-    rank: i + 1,
-    slug: s.board.slug,
-    name: s.board.name,
-    category: s.board.category,
-    chains: s.board.chains,
-    tvl_usd: s.board.tvl_usd,
-    change_7d: s.board.change_7d,
-    listed_at: s.board.listed_at,
-    age_days: s.board.age_days,
-    token_status: "pre-token",
-    on_watchlist: s.board.on_watchlist,
-    implied_value_usd: s.board.implied_value_usd,
-    model: s.board.model,
-    farm_steps: s.board.steps.map(joinStep),
-  }));
+  const oddsTerms: OddsTerm[] = [];
+  let ospec: OSpec = { ...EMPTY_ODDS };
+  let baseCV = brierCV(peers, ospec);
+  let baseWF = brierWF(peers, ospec);
+  oddsTerms.push({ name: "Base rate", cv: r4(baseCV), wf: r4(baseWF), kept: false, note: "baseline" });
+  const oCands: { key: keyof OSpec; name: string }[] = [
+    { key: "age", name: "Age, log years" },
+    { key: "fam", name: "Family token rate" },
+    { key: "tvl", name: "Size, log TVL" },
+    { key: "growth", name: "7-day TVL growth" },
+    { key: "chains", name: "Chain count" },
+    { key: "placebo", name: "Placebo: another row's week" },
+  ];
+  for (const cand of oCands) {
+    const next: OSpec = { ...ospec, [cand.key]: true };
+    const cv = brierCV(peers, next);
+    const wf = brierWF(peers, next);
+    const kept = cv < baseCV - ECON.keep_brier && wf < baseWF - ECON.keep_brier;
+    oddsTerms.push({ name: cand.name, cv: r4(cv), wf: r4(wf), kept, note: kept ? "kept" : "tested, not kept" });
+    if (kept) {
+      ospec = next;
+      baseCV = cv;
+      baseWF = wf;
+    }
+  }
+  const oddsFit = fitOdds(peers, ospec);
+  const oddsNameList = oddsNames(ospec);
 
-  const rows: RadarRow[] = scored.map((s, i) => ({ ...s.row, rank: i + 1 }));
+  const looSigned = looErrors(comps, spec, false);
+  let hit50 = 0;
+  let hit80 = 0;
+  for (let i = 0; i < looSigned.length; i++) {
+    const others = looSigned.filter((_, j) => j !== i);
+    const e = looSigned[i]!;
+    if (e >= quantile(others, 0.25) && e <= quantile(others, 0.75)) hit50 += 1;
+    if (e >= quantile(others, 0.1) && e <= quantile(others, 0.9)) hit80 += 1;
+  }
+  const q10 = quantile(looSigned, 0.1);
+  const q25 = quantile(looSigned, 0.25);
+  const q75 = quantile(looSigned, 0.75);
+  const q90 = quantile(looSigned, 0.9);
+
+  const datedComps = comps.filter((c) => c.listed).sort((a, b) => cmp(a.listed, b.listed) || cmp(a.slug, b.slug));
+  const covCut = Math.max(12, Math.floor(datedComps.length * 0.6));
+  const covTrain = datedComps.slice(0, covCut);
+  const covTest = datedComps.slice(covCut);
+  const trainRes = looErrors(covTrain, spec, false);
+  const tq10 = quantile(trainRes, 0.1);
+  const tq25 = quantile(trainRes, 0.25);
+  const tq75 = quantile(trainRes, 0.75);
+  const tq90 = quantile(trainRes, 0.9);
+  const covFit = fitValue(covTrain, spec);
+  let wf50 = 0;
+  let wf80 = 0;
+  for (const c of covTest) {
+    const e = log10(c.mcap) - log10(predictMcap(covFit, c));
+    if (e >= tq25 && e <= tq75) wf50 += 1;
+    if (e >= tq10 && e <= tq90) wf80 += 1;
+  }
+
+  const watch = new Set(snapshot.watchlist);
+  const chosen: ScoredProto[] = [];
+  for (const p of ordered) {
+    if (!recordsNoToken(p) || houseOut(p)) continue;
+    const tier: ScoredProto["tier"] = watch.has(p.slug) ? "watchlist" : p.tvl_usd >= snapshot.floor_usd ? "off-list" : "early";
+    const peer = peerBySlug.get(p.slug)!;
+    chosen.push({ protocol: p, tier, age: ageDays(asOf, p.listed_at), g: growthOf(p.change_7d), placebo: placebo.get(p.slug) ?? 0, peer });
+  }
+
+  const catDisplay = categoryPremiums(comps, pricing.a, pricing.b);
+
+  function multsFor(row: ScoredProto): Factor[] {
+    const catLog = (spec.cat ? pricing.cat : alt.cat.cat).get(row.peer.cat) ?? catDisplay.get(row.peer.cat) ?? 0;
+    const gFit = spec.growth ? pricing : alt.growth;
+    const ageFit = spec.age ? pricing : alt.age;
+    const chFit = spec.chains ? pricing : alt.chains;
+    const plFit = spec.placebo ? pricing : alt.placebo;
+    const ageLo = log10(ECON.age_clamp[0]);
+    const ageHi = log10(ECON.age_clamp[1]);
+    const lage = log10(Math.max(30, row.age ?? ECON.age_unknown));
+    const ageEff = clamp(ageFit.ageCoef * (lage - ageFit.ageRef), ageLo, ageHi);
+    return [
+      { name: "Category", mult: Math.pow(10, catLog), used: spec.cat },
+      { name: "7-day growth", mult: Math.pow(10, gFit.gCoef * (row.g - gFit.gMean)), used: spec.growth },
+      { name: "Years listed", mult: Math.pow(10, ageEff), used: spec.age },
+      { name: "Chain count", mult: Math.pow(10, chFit.chCoef * (Math.min(row.protocol.chains.length, 8) - chFit.chMean)), used: spec.chains },
+      { name: "Placebo week", mult: Math.pow(10, plFit.plCoef * (row.placebo - plFit.plMean)), used: spec.placebo },
+    ];
+  }
+
+  function priceOne(row: ScoredProto, fit: VFit, oFit: { weights: number[]; fam: Map<string, number> }, oUse: OSpec): { value: number; odds: number; implied: number } {
+    const pred = predictMcap(fit, {
+      slug: row.protocol.slug,
+      cat: row.peer.cat,
+      tvl: row.protocol.tvl_usd,
+      mcap: 1,
+      x: log10(Math.max(1, row.protocol.tvl_usd)),
+      ly: 0,
+      g: row.g,
+      age: row.age,
+      listed: row.protocol.listed_at ?? "",
+      chains: row.protocol.chains.length,
+      placebo: row.placebo,
+    });
+    const value = Math.max(1, Math.round(pred));
+    const odds = probOf(oFit, row.peer, oUse);
+    const implied = Math.max(1, Math.min(ECON.implied_cap, Math.round(value * odds)));
+    return { value, odds, implied };
+  }
+
+  const rng = mulberry32(0x5a17e);
+  const bags = new Map<string, number[]>();
+  for (const row of chosen) bags.set(row.protocol.slug, []);
+  for (let b = 0; b < ECON.boot; b++) {
+    const fitB = fitValue(resample(rng, comps), spec);
+    const oddsB = fitOdds(resample(rng, peers), ospec);
+    const scored = chosen.map((row) => ({ slug: row.protocol.slug, implied: priceOne(row, fitB, oddsB, ospec).implied }));
+    scored.sort((a, c) => c.implied - a.implied || cmp(a.slug, c.slug));
+    scored.forEach((s, i) => bags.get(s.slug)!.push(i + 1));
+  }
+
+  const draft = chosen.map((row) => {
+    const priced = priceOne(row, pricing, oddsFit, ospec);
+    const factors = multsFor(row);
+    const curve = Math.pow(10, pricing.a + pricing.b * log10(Math.max(1, row.protocol.tvl_usd)));
+    const chain = pickChain(row.protocol.chains);
+    const play = playId(row.protocol.category);
+    const plan = planNumbers(row.protocol.tvl_usd, priced.implied, row.protocol.change_7d, play, chain, ECON.deposit, ECON.share, ECON.weeks);
+    const ox = design(row.peer, ospec, oddsFit.fam);
+    const spreadLo = Math.pow(10, q25);
+    const spreadHi = Math.pow(10, q75);
+    const impliedLo = Math.max(1, Math.round(priced.implied * Math.min(spreadLo, 1)));
+    const impliedHi = Math.max(priced.implied, Math.round(priced.implied * Math.max(spreadHi, 1)));
+    const ranks = bags.get(row.protocol.slug)!.slice().sort((a, c) => a - c);
+    let rankLo = ranks[Math.round(0.1 * (ranks.length - 1))] ?? 1;
+    let rankHi = ranks[Math.round(0.9 * (ranks.length - 1))] ?? chosen.length;
+    return {
+      row, priced, factors, curve, chain, play, plan, ox, impliedLo, impliedHi, rankLo, rankHi,
+    };
+  });
+  draft.sort((a, b) => b.priced.implied - a.priced.implied || cmp(a.row.protocol.slug, b.row.protocol.slug));
+
+  const rows: RadarRow[] = draft.map((d, i) => {
+    const rank = i + 1;
+    const rankLo = Math.min(d.rankLo, rank);
+    const rankHi = Math.max(d.rankHi, rank);
+    const steps = buildSteps(d.row.protocol, d.play, d.chain.chain, { gas: d.chain.gas }, d.plan, d.priced.implied);
+    return {
+      rank,
+      rank_lo: rankLo,
+      rank_hi: rankHi,
+      slug: d.row.protocol.slug,
+      name: d.row.protocol.name,
+      category: d.row.protocol.category,
+      chains: d.row.protocol.chains,
+      tvl_usd: d.row.protocol.tvl_usd,
+      change_7d: d.row.protocol.change_7d,
+      listed_at: d.row.protocol.listed_at,
+      age_days: d.row.age,
+      tier: d.row.tier,
+      on_watchlist: d.row.tier === "watchlist",
+      g: d.row.g,
+      ox: d.ox,
+      curve: d.curve,
+      factors: d.factors,
+      value_if_usd: d.priced.value,
+      odds: d.priced.odds,
+      implied_value_usd: d.priced.implied,
+      implied_lo: d.impliedLo,
+      implied_hi: d.impliedHi,
+      play: d.play,
+      farm_chain: d.chain.chain,
+      plan: d.plan,
+      steps,
+    };
+  });
+
   const verdicts = { farm: 0, thin: 0, skip: 0 };
-  for (const row of rows) verdicts[row.verdict] += 1;
+  for (const row of rows) verdicts[row.plan.verdict] += 1;
+  const compSlugs = new Set(comps.map((c) => c.slug));
+  const ledger = ledgerBuckets(snapshot, compSlugs);
+  const ledgerTotal = ledger.reduce((s, b) => s + b.n, 0);
+  if (ledgerTotal !== snapshot.protocols.length) {
+    throw new SnapshotError(`ledger sums to ${ledgerTotal}, snapshot has ${snapshot.protocols.length}`);
+  }
+  const watchHit = rows.filter((r) => r.on_watchlist).length;
+  if (watchHit !== snapshot.watchlist.length) {
+    throw new SnapshotError(`watchlist covered ${watchHit} of ${snapshot.watchlist.length}`);
+  }
 
-  const compRows: CompRow[] = comps
-    .map((p) => {
-      const predicted = dollars(predictMcap(p.tvl_usd, p.category, fit));
-      const error = p.mcap_usd! > 0 ? r2(((predicted - p.mcap_usd!) / p.mcap_usd!) * 100) : 0;
-      return {
-        slug: p.slug,
-        name: p.name,
-        category: p.category,
-        tvl_usd: p.tvl_usd,
-        mcap_usd: p.mcap_usd!,
-        multiple: r6(p.mcap_usd! / p.tvl_usd),
-        predicted_mcap_usd: predicted,
-        error_pct: error,
-      };
-    })
-    .sort((a, b) => b.tvl_usd - a.tvl_usd || cmpStr(a.slug, b.slug));
+  const catObj: Record<string, number> = {};
+  for (const [k, v] of [...pricing.cat.entries()].sort((a, b) => cmp(a[0], b[0]))) catObj[k] = v;
+  const catShow: Record<string, number> = {};
+  for (const [k, v] of [...catDisplay.entries()].sort((a, b) => cmp(a[0], b[0]))) catShow[k] = v;
 
-  const early = rows.filter((r) => !r.on_watchlist).length;
-  const radar: RadarData = {
-    as_of: snapshot.as_of,
+  const keptValue = valueTerms.filter((t) => t.kept).length;
+  const keptOdds = oddsTerms.filter((t) => t.kept).length;
+  const beats = curLoo < flatLoo && curWf < flatWf;
+  const blurb = `Implied value is the size curve${spec.cat ? " × category" : ""}${spec.growth ? " × 7-day growth" : ""}${spec.age ? " × years listed" : ""} times the peers' token odds. Leave-one-out miss ${curLoo.toFixed(2)}× versus a flat multiple ${flatLoo.toFixed(2)}×. Walk-forward ${curWf.toFixed(2)}× versus ${flatWf.toFixed(2)}×. ${beats ? "The kept model beats flat on both checks." : "Flat is closer on at least one check."}`;
+
+  const radar = {
+    as_of: asOf,
     source: snapshot.source,
     floor_usd: snapshot.floor_usd,
     model_version: MODEL_VERSION,
-    constants: CONST,
-    blurb: copy.blurb,
-    note: copy.note,
-    assumptions: copy.assumptions,
-    fit: report,
-    watchlist_size: snapshot.watchlist.length,
-    board_size: rows.length,
-    early_size: early,
+    blurb,
+    checksum: checksumOf(rows),
+    ledger,
+    ledger_total: ledgerTotal,
+    fit: {
+      a: pricing.a,
+      b: pricing.b,
+      scale: pricing.scale,
+      flat_multiple: median(comps.map((c) => c.mcap / c.tvl)),
+      g_coef: spec.growth ? pricing.gCoef : alt.growth.gCoef,
+      g_mean: spec.growth ? pricing.gMean : alt.growth.gMean,
+      age_coef: spec.age ? pricing.ageCoef : alt.age.ageCoef,
+      age_ref: spec.age ? pricing.ageRef : alt.age.ageRef,
+      use: { cat: spec.cat, growth: spec.growth, age: spec.age, chains: spec.chains, placebo: spec.placebo },
+      cat: spec.cat ? catObj : catShow,
+      loo: r4(curLoo),
+      loo_flat: r4(flatLoo),
+      wf: r4(curWf),
+      wf_flat: r4(flatWf),
+      loo_n: comps.length,
+      wf_n: wfErrors(comps, spec, false).length,
+      q10, q25, q75, q90,
+      honest50: looSigned.length ? hit50 / looSigned.length : 0,
+      honest80: looSigned.length ? hit80 / looSigned.length : 0,
+      honest_n: looSigned.length,
+      wf50: covTest.length ? wf50 / covTest.length : 0,
+      wf80: covTest.length ? wf80 / covTest.length : 0,
+      wf_cov_n: covTest.length,
+      comps_n: comps.length,
+      terms: valueTerms,
+      kept: keptValue,
+      tried: valueTerms.length - 1,
+      beats_flat: beats,
+    },
+    odds: {
+      names: oddsNameList,
+      weights: oddsFit.weights,
+      cv: r4(baseCV),
+      cv_base: oddsTerms[0]!.cv,
+      wf: r4(baseWF),
+      wf_base: oddsTerms[0]!.wf,
+      terms: oddsTerms,
+      kept: keptOdds,
+      tried: oddsTerms.length - 1,
+    },
+    econ: {
+      tbill: ECON.tbill,
+      farm_dph: ECON.farm_dph,
+      crash: ECON.crash,
+      deposit: ECON.deposit,
+      share: ECON.share,
+      weeks: ECON.weeks,
+      gas: GAS,
+      gas_default: GAS_DEFAULT,
+      plays: PLAYS,
+    },
     verdicts,
+    watchlist_size: snapshot.watchlist.length,
+    watchlist_ranked: watchHit,
+    board_size: rows.length,
     rows,
-    comps: compRows,
+    comps: comps
+      .map((c) => ({ name: ordered.find((p) => p.slug === c.slug)?.name ?? c.slug, category: c.cat, tvl: c.tvl, mcap: c.mcap }))
+      .sort((a, b) => b.tvl - a.tvl || cmp(a.name, b.name)),
   };
+
+  const board: BoardRow[] = rows.map((r) => ({
+    rank: r.rank,
+    slug: r.slug,
+    name: r.name,
+    implied_value_usd: r.implied_value_usd,
+    farm_steps: r.steps,
+    tier: r.tier,
+    verdict: r.plan.verdict,
+  }));
   return { board, radar };
 }
 
@@ -1021,7 +1262,7 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
     if (typeof row.name !== "string" || row.name.length === 0) return `${row.slug} has no name`;
     if (!Number.isSafeInteger(row.rank) || row.rank <= 0) return `${row.slug} has rank ${row.rank}`;
     ranks.push(row.rank);
-    if (!Number.isSafeInteger(row.implied_value_usd) || row.implied_value_usd <= 0 || row.implied_value_usd > CONST.implied_cap) {
+    if (!Number.isSafeInteger(row.implied_value_usd) || row.implied_value_usd <= 0 || row.implied_value_usd > ECON.implied_cap) {
       return `${row.slug} has implied value ${row.implied_value_usd}`;
     }
     if (row.farm_steps.length < 3 || row.farm_steps.length > 12) return `${row.slug} has ${row.farm_steps.length} farm steps`;
@@ -1032,18 +1273,16 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
   }
   const missing = snapshot.watchlist.filter((slug) => !seen.has(slug));
   if (missing.length > 0) return `missing watchlist slugs: ${missing.slice(0, 5).join(", ")}`;
-  const ordered = [...ranks].sort((a, b) => a - b);
-  for (let i = 0; i < ordered.length; i++) if (ordered[i] !== i + 1) return `rank ${i + 1} is missing`;
+  const order = [...ranks].sort((a, b) => a - b);
+  for (let i = 0; i < order.length; i++) if (order[i] !== i + 1) return `rank ${i + 1} is missing`;
   const byRank = [...board].sort((a, b) => a.rank - b.rank);
   for (let i = 1; i < byRank.length; i++) {
     if (byRank[i]!.implied_value_usd > byRank[i - 1]!.implied_value_usd) return `rank ${i + 1} outranks rank ${i}`;
   }
-  if (byRank.length >= 2 && byRank[0]!.implied_value_usd === byRank[byRank.length - 1]!.implied_value_usd) {
-    return "every row has the same implied value";
-  }
+  if (byRank.length >= 2 && byRank[0]!.implied_value_usd === byRank[byRank.length - 1]!.implied_value_usd) return "every row has the same implied value";
   return null;
 }
 
-export function dataScript(radar: RadarData): string {
+export function dataScript(radar: unknown): string {
   return `window.RADAR=${JSON.stringify(radar)};\n`;
 }
